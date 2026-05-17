@@ -1,10 +1,26 @@
 """
 QRR — Quantum Relational Reasoner
-A new AI paradigm: do not collapse reality until evidence demands it.
+==================================
+Late-collapse inference via coherent branch superposition.
 
-Version: 0.1.0 (research prototype)
-Author: Sebastián Sifontes Valentín
+Version: 0.2.0
+Status:  Alpha — active research, API subject to change
+Author:  Sebastián Sifontes Valentín
+License: MIT
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "Sebastián Sifontes Valentín"
+__license__ = "MIT"
+
+from qrr.qrr_model import QRRModel
+from qrr.branch_bank import BranchBank
+from qrr.collapse_index import CollapseIndex
+from qrr.decoherence_module import DecoherenceModule
+
+__all__ = [
+    "QRRModel",
+    "BranchBank",
+    "CollapseIndex",
+    "DecoherenceModule",
+]

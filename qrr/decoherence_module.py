@@ -1,104 +1,82 @@
 """
-Decoherence Module — Controlled collapse of branch superposition.
+Decoherence Module — controlled branch collapse.
 
-Reduces the full branch density matrix to a classical mixture
-and samples a single branch for output generation.
+Triggered when χ < threshold. Merges or selects branches
+to produce a final hidden state for the output head.
 
-Collapse is triggered only when:
-  (a) An action requires commitment (action_required=True)
-  (b) Residual ambiguity χ < τ_χ (evidence is clear)
-  (c) Mutual information I(R; O) > τ_I
-  (d) Computational budget is exceeded
+Two collapse strategies:
+  'weighted_sum' : final_h = sum_k p^(k) * h^(k)  (soft, differentiable)
+  'argmax'       : final_h = h^(argmax_k p^(k))    (hard, not differentiable)
+
+During training: use 'weighted_sum'.
+During inference (agent actions): use 'argmax' or temperature-scaled sampling.
 """
 
+from __future__ import annotations
 import torch
 import torch.nn as nn
-from typing import Tuple
+from qrr.branch_bank import BranchState
 
 
 class DecoherenceModule(nn.Module):
     """
+    Collapses the branch bank into a single hidden state.
+
     Args:
-        tau_chi: χ threshold below which collapse is triggered (default 0.3).
-        tau_I: Mutual information threshold for collapse (default 0.7).
-        training_collapse_prob: During training, probability of
-                                forcing a collapse for supervision.
+        strategy: 'weighted_sum' (default, differentiable) or 'argmax' (hard).
+        temperature: Softmax temperature applied to probabilities before collapse.
+                     temperature=1.0 uses raw probabilities.
+                     temperature→0 approaches argmax.
     """
 
     def __init__(
         self,
-        tau_chi: float = 0.3,
-        tau_I: float = 0.7,
-        training_collapse_prob: float = 0.5,
-    ):
+        strategy: str = "weighted_sum",
+        temperature: float = 1.0,
+    ) -> None:
         super().__init__()
-        self.tau_chi = tau_chi
-        self.tau_I = tau_I
-        self.training_collapse_prob = training_collapse_prob
+        if strategy not in ("weighted_sum", "argmax"):
+            raise ValueError(f"Unknown strategy '{strategy}'. Use 'weighted_sum' or 'argmax'.")
+        self.strategy = strategy
+        self.temperature = temperature
 
-    def forward(
-        self,
-        H: torch.Tensor,         # (B, K, d_model)
-        alpha: torch.Tensor,     # (B, K) complex or real
-        chi: torch.Tensor,       # (B,) collapse index
-        mutual_info: torch.Tensor = None,  # (B,) optional I(R;O)
-        action_required: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, state: BranchState) -> torch.Tensor:
         """
+        Collapse branch bank to a single hidden state.
+
+        Args:
+            state: BranchState from BranchBank
+
         Returns:
-            h_out: (B, d_model) — output hidden state
-            k_star: (B,) — selected branch index
-            p: (B, K) — branch probabilities |α_k|²
+            h_collapsed: shape (batch, d)
         """
-        probs = alpha.abs() ** 2 if torch.is_complex(alpha) else alpha ** 2
-        probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)  # (B, K)
+        probs = state.probabilities  # (batch, K)
+        hidden = state.hidden        # (batch, K, d)
 
-        # Determine whether to collapse
-        collapse_flag = self._should_collapse(
-            chi, mutual_info, action_required
-        )  # (B,)
+        if self.strategy == "argmax":
+            idx = probs.argmax(dim=-1, keepdim=True)        # (batch, 1)
+            idx = idx.unsqueeze(-1).expand(-1, -1, hidden.size(-1))  # (batch, 1, d)
+            h_collapsed = hidden.gather(1, idx).squeeze(1)  # (batch, d)
 
-        B, K, d = H.shape
-        h_out = torch.zeros(B, d, device=H.device, dtype=H.dtype)
-        k_star = torch.zeros(B, dtype=torch.long, device=H.device)
+        else:  # weighted_sum
+            if self.temperature != 1.0:
+                probs = torch.softmax(probs / self.temperature, dim=-1)
+            # (batch, K, 1) * (batch, K, d) → (batch, d)
+            h_collapsed = (probs.unsqueeze(-1) * hidden).sum(dim=1)
 
-        for b in range(B):
-            if collapse_flag[b]:
-                # Sample k* from branch probability distribution
-                k_s = torch.multinomial(probs[b], num_samples=1).squeeze()
-                h_out[b] = H[b, k_s]
-                k_star[b] = k_s
-            else:
-                # Weighted mixture — no collapse yet
-                h_out[b] = (probs[b].unsqueeze(-1) * H[b]).sum(dim=0)
-                k_star[b] = probs[b].argmax()
+        return h_collapsed
 
-        return h_out, k_star, probs
+    def interference_loss(self, state: BranchState) -> torch.Tensor:
+        """
+        Auxiliary loss that penalizes branches with near-identical hidden states.
+        Encourages branch diversity (constructive interference requires distinct branches).
 
-    def _should_collapse(
-        self,
-        chi: torch.Tensor,
-        mutual_info: torch.Tensor,
-        action_required: bool,
-    ) -> torch.Tensor:
-        """Returns boolean tensor (B,) indicating collapse decision."""
-        B = chi.shape[0]
-        flag = torch.zeros(B, dtype=torch.bool, device=chi.device)
-
-        if action_required:
-            flag = torch.ones(B, dtype=torch.bool, device=chi.device)
-            return flag
-
-        # Low ambiguity → collapse
-        flag = flag | (chi < self.tau_chi)
-
-        # High mutual information → collapse
-        if mutual_info is not None:
-            flag = flag | (mutual_info > self.tau_I)
-
-        # During training: stochastic forced collapse for supervision
-        if self.training:
-            random_mask = torch.rand(B, device=chi.device) < self.training_collapse_prob
-            flag = flag | random_mask
-
-        return flag
+        Returns: scalar loss term (add to total loss with weight λ_div)
+        """
+        h = state.hidden  # (batch, K, d)
+        h_norm = h / (h.norm(dim=-1, keepdim=True) + 1e-9)
+        sim = torch.bmm(h_norm, h_norm.transpose(1, 2))  # (batch, K, K)
+        # Penalize high off-diagonal similarity
+        eye = torch.eye(h.size(1), device=h.device).unsqueeze(0)
+        off_diag = sim * (1 - eye)
+        return off_diag.abs().mean()

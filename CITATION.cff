@@ -6,17 +6,19 @@ authors:
   - family-names: Sifontes Valentín
     given-names: Sebastián
     orcid: ""
-    affiliation: Independent Researcher, Madrid, ES
+    affiliation: "Independent Researcher, Madrid, ES"
 repository-code: https://github.com/sebsv123/qrr-quantum-relational-reasoner
 license: MIT
 version: 0.2.0
-date-released: "2026-05-17"
+date-released: "2026-05-18"
 abstract: >
   QRR is a classical AI architecture that maintains K competing latent hypotheses
   (branches) with complex amplitudes throughout inference, delaying commitment to
   a single interpretation until evidence forces a decision. It imports three
   structural principles from quantum mechanics — superposition, interference, and
   decoherence — into a transformer-based model without requiring quantum hardware.
+  The key innovation is a scalar Collapse Index χ ∈ [0,1] that measures residual
+  ambiguity and gates the decoherence operation.
 keywords:
   - machine learning
   - large language models
@@ -26,3 +28,5 @@ keywords:
   - decoherence
   - ambiguity resolution
   - AI architecture
+  - late collapse
+  - branch bank

@@ -1,134 +1,112 @@
 """
-Branch Bank — Core module of QRR.
+Branch Bank — Core QRR module.
 
-Maintains K competing latent hypotheses (branches) with complex amplitudes.
-Each branch represents a coherent interpretation of the input context.
+Maintains K latent hypotheses (branches) with complex amplitudes.
+Each branch is a hidden state vector h^(k) ∈ R^d paired with a
+complex amplitude α^(k) ∈ C.
+
+The probability of each branch is |α^(k)|^2 (Born rule analog).
+The collapse index χ = 1 - max_k |α^(k)|^2 / sum_j |α^(j)|^2
+measures residual ambiguity across branches.
 """
 
+from __future__ import annotations
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple
+from typing import NamedTuple
+
+
+class BranchState(NamedTuple):
+    """Immutable snapshot of the branch bank at a single time step."""
+    hidden: torch.Tensor          # shape: (batch, K, d)
+    amplitudes: torch.Tensor      # shape: (batch, K, 2)  — [real, imag]
+    probabilities: torch.Tensor   # shape: (batch, K)     — |α|^2 normalized
+    chi: torch.Tensor             # shape: (batch,)       — collapse index ∈ [0,1]
 
 
 class BranchBank(nn.Module):
     """
-    Maintains K latent branches with complex amplitudes.
+    Core branch bank for QRR.
 
     Args:
-        d_model: Hidden dimension of the transformer backbone.
-        K: Number of branches (default 8).
-        use_complex_phase: Whether to use full complex amplitudes.
-                           If False, uses real amplitudes only (curriculum phase 1).
-        sparsity_k: Max number of active branches (top-k sparsity constraint).
+        hidden_dim: Dimensionality of each branch hidden state (must match base model).
+        k_branches:  Number of competing hypotheses to maintain.
+        init_uniform: If True, initialize amplitudes uniformly (equal superposition).
+                      If False, initialize with small random perturbations.
     """
 
     def __init__(
         self,
-        d_model: int,
-        K: int = 8,
-        use_complex_phase: bool = False,
-        sparsity_k: int = None,
-    ):
+        hidden_dim: int,
+        k_branches: int = 4,
+        init_uniform: bool = True,
+    ) -> None:
         super().__init__()
-        self.d_model = d_model
-        self.K = K
-        self.use_complex_phase = use_complex_phase
-        self.sparsity_k = sparsity_k or K
+        self.d = hidden_dim
+        self.K = k_branches
 
-        # Branch initialization projections: map transformer hidden to K branches
-        self.branch_projections = nn.Linear(d_model, K * d_model)
+        # Learnable branch projection: maps base hidden state to K branch states
+        self.branch_proj = nn.Linear(hidden_dim, k_branches * hidden_dim, bias=False)
 
-        # Amplitude head: produces (magnitude, phase) per branch
-        self.amplitude_head_r = nn.Linear(d_model, K)  # magnitude (r)
-        if use_complex_phase:
-            self.amplitude_head_phi = nn.Linear(d_model, K)  # phase (φ)
-        else:
-            self.register_parameter('amplitude_head_phi', None)
+        # Learnable amplitude initializer: maps base hidden state to K complex amplitudes
+        self.amp_proj = nn.Linear(hidden_dim, k_branches * 2)  # real + imag per branch
 
-    def forward(
-        self,
-        x: torch.Tensor,  # (B, L, d_model)
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.init_uniform = init_uniform
+
+    def forward(self, h_base: torch.Tensor) -> BranchState:
         """
+        Initialize or update branch bank from base transformer hidden state.
+
         Args:
-            x: Transformer hidden states (B, L, d_model)
+            h_base: shape (batch, d) — pooled hidden state from base transformer
 
         Returns:
-            H: Branch hidden states (B, K, d_model)
-            alpha: Complex amplitudes (B, K) — as (real, imag) or real-only
+            BranchState with K branches initialized from h_base
         """
-        # Use [CLS]-equivalent or mean pooling for amplitude routing
-        x_pooled = x.mean(dim=1)  # (B, d_model)
+        batch = h_base.size(0)
 
-        # Project to K branches
-        H = self.branch_projections(x_pooled)  # (B, K * d_model)
-        H = H.view(-1, self.K, self.d_model)   # (B, K, d_model)
+        # Project to K branch hidden states
+        hidden = self.branch_proj(h_base)              # (batch, K*d)
+        hidden = hidden.view(batch, self.K, self.d)    # (batch, K, d)
 
-        # Compute amplitudes
-        r = F.softplus(self.amplitude_head_r(x_pooled))  # (B, K), magnitudes > 0
-
-        if self.use_complex_phase and self.amplitude_head_phi is not None:
-            phi = self.amplitude_head_phi(x_pooled)  # (B, K), phases
-            # Complex amplitude: α = r * e^(iφ)
-            alpha_real = r * torch.cos(phi)  # (B, K)
-            alpha_imag = r * torch.sin(phi)  # (B, K)
-            alpha = torch.complex(alpha_real, alpha_imag)  # (B, K) complex
+        # Compute complex amplitudes
+        if self.init_uniform:
+            # Equal superposition: all branches start with equal weight
+            amp_real = torch.full((batch, self.K), 1.0 / (self.K ** 0.5), device=h_base.device)
+            amp_imag = torch.zeros_like(amp_real)
         else:
-            alpha = r  # (B, K) real
+            raw = self.amp_proj(h_base).view(batch, self.K, 2)  # (batch, K, 2)
+            amp_real = raw[..., 0]
+            amp_imag = raw[..., 1]
 
-        # Normalize: Σ_k |α_k|² = 1
-        alpha = self._normalize_amplitudes(alpha)
+        amplitudes = torch.stack([amp_real, amp_imag], dim=-1)  # (batch, K, 2)
 
-        # Apply top-k sparsity if needed
-        if self.sparsity_k < self.K:
-            alpha = self._apply_sparsity(alpha)
+        # Compute probabilities: p^(k) = |α^(k)|^2 / sum_j |α^(j)|^2
+        norm_sq = amp_real ** 2 + amp_imag ** 2               # (batch, K)
+        probabilities = norm_sq / (norm_sq.sum(dim=-1, keepdim=True) + 1e-9)
 
-        return H, alpha
+        # Collapse index: χ = 1 - max_k p^(k)
+        chi = 1.0 - probabilities.max(dim=-1).values          # (batch,)
 
-    def _normalize_amplitudes(
-        self, alpha: torch.Tensor
-    ) -> torch.Tensor:
-        """Normalize so that Σ_k |α_k|² = 1."""
-        if torch.is_complex(alpha):
-            norm = torch.sqrt((alpha.abs() ** 2).sum(dim=-1, keepdim=True))
-        else:
-            norm = torch.sqrt((alpha ** 2).sum(dim=-1, keepdim=True))
-        return alpha / (norm + 1e-8)
+        return BranchState(
+            hidden=hidden,
+            amplitudes=amplitudes,
+            probabilities=probabilities,
+            chi=chi,
+        )
 
-    def _apply_sparsity(
-        self, alpha: torch.Tensor
-    ) -> torch.Tensor:
-        """Zero out all but top-k branches by magnitude."""
-        magnitudes = alpha.abs() if torch.is_complex(alpha) else alpha.abs()
-        _, top_indices = magnitudes.topk(self.sparsity_k, dim=-1)
-        mask = torch.zeros_like(magnitudes)
-        mask.scatter_(-1, top_indices, 1.0)
-        if torch.is_complex(alpha):
-            mask = mask.to(alpha.real.dtype)
-            alpha = torch.complex(alpha.real * mask, alpha.imag * mask)
-        else:
-            alpha = alpha * mask
-        return self._normalize_amplitudes(alpha)
+    def branch_diversity(self, state: BranchState) -> torch.Tensor:
+        """
+        Compute mean pairwise cosine distance between branch hidden states.
+        High diversity = branches have diverged; low = branches collapsed.
 
-
-def compute_chi(alpha: torch.Tensor) -> torch.Tensor:
-    """
-    Compute collapse index χ ∈ [0, 1].
-
-    χ = 1 - Σ|α|⁴ / (Σ|α|²)²
-
-    χ = 0: one branch dominates (collapsed)
-    χ = 1: maximum superposition (uniform)
-
-    Args:
-        alpha: (B, K) real or complex amplitudes (normalized)
-
-    Returns:
-        chi: (B,) collapse index
-    """
-    probs = alpha.abs() ** 2 if torch.is_complex(alpha) else alpha ** 2
-    sum_p2 = (probs ** 2).sum(dim=-1)          # Σ|α|⁴
-    sum_p = probs.sum(dim=-1)                   # Σ|α|²
-    chi = 1.0 - sum_p2 / (sum_p ** 2 + 1e-8)
-    return chi
+        Returns: scalar tensor (mean over batch)
+        """
+        h = state.hidden  # (batch, K, d)
+        h_norm = h / (h.norm(dim=-1, keepdim=True) + 1e-9)
+        # Cosine similarity matrix: (batch, K, K)
+        sim = torch.bmm(h_norm, h_norm.transpose(1, 2))
+        # Mean off-diagonal distance
+        mask = ~torch.eye(self.K, dtype=torch.bool, device=h.device).unsqueeze(0)
+        diversity = (1.0 - sim[mask.expand_as(sim)]).mean()
+        return diversity

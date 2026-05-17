@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+dist/
+build/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# PyTorch / ML
+*.pt
+*.pth
+*.ckpt
+*.bin
+checkpoints/
+runs/
+wandb/
+
+# Experiments output
+experiments/*.png
+experiments/*.csv
+experiments/*.json
+experiments/results/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# Secrets
+.env
+*.key
+
+# Large data files
+data/
+*.parquet
+*.arrow
