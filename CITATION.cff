@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+title: "Quantum Relational Reasoner (QRR): Late-Collapse Inference via Coherent Branch Superposition"
+message: "If you use QRR in your research, please cite this work."
+type: software
+authors:
+  - family-names: Sifontes Valentín
+    given-names: Sebastián
+    orcid: ""
+    affiliation: Independent Researcher, Madrid, ES
+repository-code: https://github.com/sebsv123/qrr-quantum-relational-reasoner
+license: MIT
+version: 0.2.0
+date-released: "2026-05-17"
+abstract: >
+  QRR is a classical AI architecture that maintains K competing latent hypotheses
+  (branches) with complex amplitudes throughout inference, delaying commitment to
+  a single interpretation until evidence forces a decision. It imports three
+  structural principles from quantum mechanics — superposition, interference, and
+  decoherence — into a transformer-based model without requiring quantum hardware.
+keywords:
+  - machine learning
+  - large language models
+  - uncertainty quantification
+  - coherent inference
+  - superposition
+  - decoherence
+  - ambiguity resolution
+  - AI architecture
