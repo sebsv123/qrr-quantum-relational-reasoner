@@ -1,39 +1,39 @@
 """
 Unitary Mixer — coherent evolution of branch hidden states.
 
-Inspired by quantum unitary evolution: U|ψ⟩.
-Mixes K branch hidden states while approximately preserving
-the total amplitude norm (analogous to unitary transformation).
+In quantum mechanics, time evolution of a closed system is unitary:
+  |ψ(t+1)⟩ = U |ψ(t)⟩,  where U†U = I
+
+Here, U_kj(x_t, c_t) mixes branch hidden states while approximately
+preserving the total amplitude norm — analogous to unitary evolution.
 
 Two parametrizations:
-  'cayley'  : U = (I - A)(I + A)^{-1}, A skew-symmetric → exact unitary
-  'learned' : free linear mixer with orthogonality regularization loss
+  'cayley'  : U = (I - A)(I + A)^{-1}, A skew-symmetric → exact orthogonal matrix.
+              Slower but norm-preserving by construction.
+  'learned' : Unconstrained linear mixing with soft orthogonality regularizer.
+              Faster, differentiable, norm approximately preserved via L_coh loss.
 
-The Cayley parametrization guarantees ‖α‖ is preserved exactly.
-The learned variant is faster but requires λ_orth penalty in training.
-
-Reference: Cayley transform for unitary matrices:
-  Helfrich et al. (2018) "Orthogonal Recurrent Neural Networks"
+The context vector c_t (from the input) modulates U, making evolution
+input-dependent — branches evolve differently based on what is observed.
 """
 
 from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from qrr.branch_bank import BranchState
 
 
 class UnitaryMixer(nn.Module):
     """
-    Mixes K branch hidden states via an approximately unitary transformation.
-    Conditioned on the current token embedding and context vector.
+    Context-conditioned approximate unitary mixer for branch hidden states.
+
+    h̃^(k)_{t+1} = Σ_j U_kj(x_t, c_t) · h^(j)_t
 
     Args:
-        hidden_dim:  Dimensionality d of each branch hidden state.
-        k_branches:  Number of branches K.
-        context_dim: Dimensionality of the context conditioning vector (default = hidden_dim).
-        parametrization: 'cayley' (exact unitary) or 'learned' (free + regularized).
-        num_heads:   Number of attention heads for context conditioning.
+        hidden_dim:   Dimensionality of branch hidden states.
+        k_branches:   Number of branches K.
+        context_dim:  Dimensionality of context vector c_t.
+        parametrize:  'cayley' (exact orthogonal) or 'learned' (soft).
     """
 
     def __init__(
@@ -41,120 +41,74 @@ class UnitaryMixer(nn.Module):
         hidden_dim: int,
         k_branches: int = 4,
         context_dim: int | None = None,
-        parametrization: str = "cayley",
-        num_heads: int = 4,
+        parametrize: str = "learned",
     ) -> None:
         super().__init__()
         self.d = hidden_dim
         self.K = k_branches
-        self.parametrization = parametrization
+        self.parametrize = parametrize
         context_dim = context_dim or hidden_dim
 
-        # Context → mixing matrix generator
-        # Outputs K×K mixing coefficients conditioned on current input
-        self.mixer_gen = nn.Sequential(
-            nn.Linear(context_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, k_branches * k_branches),
+        # Context → mixing matrix (K×K weights)
+        self.context_proj = nn.Sequential(
+            nn.Linear(context_dim, k_branches * k_branches),
+            nn.Tanh(),
         )
 
-        # Per-branch transformation conditioned on context
-        self.branch_transform = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            batch_first=True,
-        )
+        if parametrize == "cayley":
+            # Skew-symmetric generator A: K×K, A^T = -A
+            # U = (I - A)(I + A)^{-1}  is orthogonal
+            self.A_base = nn.Parameter(torch.zeros(k_branches, k_branches))
 
-        # Residual gate: how much to mix vs. keep original
-        self.gate = nn.Sequential(
-            nn.Linear(context_dim, k_branches),
-            nn.Sigmoid(),
-        )
+        # Per-branch hidden-state projection (keeps branch in same subspace)
+        self.branch_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
 
-    def _cayley_matrix(self, raw: torch.Tensor) -> torch.Tensor:
+    def _mixing_matrix(self, context: torch.Tensor) -> torch.Tensor:
         """
-        Construct a unitary matrix via Cayley transform.
-        A = raw - raw^T (skew-symmetric)
-        U = (I - A)(I + A)^{-1}
-
-        Args:
-            raw: (batch, K, K) raw mixing coefficients
-        Returns:
-            U: (batch, K, K) unitary mixing matrix
+        Compute K×K mixing matrix from context vector.
+        Returns: (batch, K, K)
         """
-        # Make skew-symmetric: A = (raw - raw^T) / 2
-        A = (raw - raw.transpose(-1, -2)) / 2.0
-        I = torch.eye(self.K, device=raw.device).unsqueeze(0)
-        # Cayley: U = (I - A)(I + A)^{-1}
-        U = torch.linalg.solve(I + A, I - A)
-        return U
+        batch = context.size(0)
+        raw = self.context_proj(context).view(batch, self.K, self.K)
+
+        if self.parametrize == "cayley":
+            # Skew-symmetric A from base + context modulation
+            A = self.A_base.unsqueeze(0) + (raw - raw.transpose(1, 2)) * 0.1
+            A = A - A.transpose(1, 2)  # enforce skew-symmetry
+            I = torch.eye(self.K, device=context.device).unsqueeze(0)
+            # Cayley transform: U = (I - A)(I + A)^{-1}
+            U = torch.linalg.solve(I + A, I - A)
+        else:
+            # Soft orthogonal: normalize columns
+            U = F.normalize(raw, dim=1)
+
+        return U  # (batch, K, K)
 
     def forward(
         self,
-        state: BranchState,
-        context: torch.Tensor,  # (batch, d) — pooled context from base transformer
-    ) -> BranchState:
+        hidden: torch.Tensor,    # (batch, K, d)
+        context: torch.Tensor,   # (batch, context_dim)
+    ) -> torch.Tensor:
         """
-        Apply coherent evolution to all branches.
+        Mix branch hidden states via context-conditioned U.
 
-        Args:
-            state:   Current BranchState
-            context: Context vector from base transformer (batch, d)
-
-        Returns:
-            Updated BranchState with mixed hidden states and updated amplitudes
+        Returns: mixed hidden states, shape (batch, K, d)
         """
-        batch = context.size(0)
-        h = state.hidden       # (batch, K, d)
-        alpha = state.amplitudes  # (batch, K, 2)
-
-        # 1. Generate K×K mixing matrix conditioned on context
-        raw_mix = self.mixer_gen(context).view(batch, self.K, self.K)  # (batch, K, K)
-
-        if self.parametrization == "cayley":
-            U = self._cayley_matrix(raw_mix)  # (batch, K, K) unitary
-        else:
-            # Learned: normalize rows for approximate orthogonality
-            U = F.normalize(raw_mix, dim=-1)
-
-        # 2. Mix hidden states: h̃^(k) = Σ_j U_{kj} h^(j)
-        h_mixed = torch.bmm(U, h)  # (batch, K, d)
-
-        # 3. Apply per-branch self-attention (branches attend to each other)
-        h_attended, _ = self.branch_transform(h_mixed, h_mixed, h_mixed)
-
-        # 4. Residual gate: blend original and transformed
-        gate = self.gate(context).unsqueeze(-1)  # (batch, K, 1)
-        h_new = gate * h_attended + (1 - gate) * h  # (batch, K, d)
-
-        # 5. Mix amplitudes with same U (amplitude evolution mirrors hidden evolution)
-        # α_real and α_imag mixed separately: ã^(k) = Σ_j U_{kj} α^(j)
-        alpha_real = alpha[..., 0]  # (batch, K)
-        alpha_imag = alpha[..., 1]  # (batch, K)
-        alpha_real_new = torch.bmm(U, alpha_real.unsqueeze(-1)).squeeze(-1)
-        alpha_imag_new = torch.bmm(U, alpha_imag.unsqueeze(-1)).squeeze(-1)
-        alpha_new = torch.stack([alpha_real_new, alpha_imag_new], dim=-1)  # (batch, K, 2)
-
-        # 6. Recompute probabilities and χ
-        norm_sq = alpha_real_new ** 2 + alpha_imag_new ** 2
-        probs_new = norm_sq / (norm_sq.sum(dim=-1, keepdim=True) + 1e-9)
-        chi_new = 1.0 - probs_new.max(dim=-1).values
-
-        from qrr.branch_bank import BranchState
-        return BranchState(
-            hidden=h_new,
-            amplitudes=alpha_new,
-            probabilities=probs_new,
-            chi=chi_new,
-        )
+        U = self._mixing_matrix(context)  # (batch, K, K)
+        # h̃^(k) = Σ_j U_kj h^(j)  →  batched matmul
+        # hidden: (batch, K, d), U: (batch, K, K)
+        mixed = torch.bmm(U, hidden)  # (batch, K, d)
+        # Per-branch projection keeps each branch in its learned subspace
+        mixed = self.branch_proj(mixed)
+        return mixed
 
     def orthogonality_loss(self, context: torch.Tensor) -> torch.Tensor:
         """
-        Auxiliary loss for 'learned' parametrization.
-        Penalizes deviation from orthogonality: ‖U^T U - I‖_F^2
+        Regularizer: penalize deviation from orthogonality.
+        ||U^T U - I||_F²  should be 0 for a true unitary.
+        Only needed for 'learned' parametrize; Cayley is exact.
         """
-        batch = context.size(0)
-        raw = self.mixer_gen(context).view(batch, self.K, self.K)
+        U = self._mixing_matrix(context)
         I = torch.eye(self.K, device=context.device).unsqueeze(0)
-        orth_err = torch.bmm(raw.transpose(-1, -2), raw) - I
-        return orth_err.pow(2).mean()
+        deviation = torch.bmm(U.transpose(1, 2), U) - I
+        return deviation.pow(2).mean()

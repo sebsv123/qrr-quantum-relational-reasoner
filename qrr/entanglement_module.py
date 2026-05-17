@@ -1,140 +1,114 @@
 """
 Entanglement Module — context-branch correlation across time.
 
-Analog of quantum entanglement: the state of each branch becomes
-correlated with the observation history (context), not just the
-current token.
+In quantum entanglement, measuring one subsystem instantaneously
+updates the state of another. In QRR, this translates to:
+when a new token or observation arrives, it selectively correlates
+with specific branches, updating their hidden states and amplitudes
+based on contextual compatibility.
 
-In standard transformers, context is a flat attention over all tokens.
-In QRR, each branch maintains its own context vector, and branches
-become "entangled" when they share observations — their hidden states
-become correlated in a structured way.
+Mechanism:
+  1. Compute compatibility score s_k = ⟨h^(k), c_t⟩ / √d for each branch k.
+  2. Convert scores to update gates g_k = softmax(s_k / τ).
+  3. Update each branch hidden state:
+     h'^(k) = h^(k) + g_k · W_ent · c_t
+  4. Update amplitudes by modulating their magnitude:
+     |α'^(k)| = |α^(k)| · (1 + ε · g_k)
+     (phase is preserved — only magnitude is updated by new evidence)
 
-Implementation:
-  Each branch k maintains a context memory c^(k) ∈ R^d.
-  At each step, c^(k) is updated via cross-attention between
-  branch k's hidden state and the full token sequence.
-  Branches that have observed the same tokens develop similar
-  context vectors (positive entanglement).
-  Branches that diverged in interpretation develop orthogonal
-  context vectors (negative entanglement / superorthogonality).
+This models the intuition: a new observation that is compatible
+with branch k amplifies it; incompatible observations suppress it.
 """
 
 from __future__ import annotations
 import torch
 import torch.nn as nn
-from qrr.branch_bank import BranchState
+import math
 
 
 class EntanglementModule(nn.Module):
     """
-    Maintains per-branch context memory and computes
-    context-branch correlation (entanglement).
+    Selective context-branch correlation update.
 
     Args:
-        hidden_dim:   Branch hidden state dimensionality.
-        k_branches:   Number of branches.
-        context_len:  Maximum context sequence length.
-        num_heads:    Attention heads for cross-attention.
+        hidden_dim:    Branch hidden state dimensionality.
+        k_branches:    Number of branches.
+        context_dim:   Context vector dimensionality.
+        temperature:   Softmax temperature τ for compatibility gates.
+                       Lower τ → sharper selection (one branch dominates).
+                       Higher τ → softer (all branches updated equally).
+        amplitude_lr:  Scale ε for amplitude modulation (default 0.1).
     """
 
     def __init__(
         self,
         hidden_dim: int,
         k_branches: int = 4,
-        num_heads: int = 4,
+        context_dim: int | None = None,
+        temperature: float = 1.0,
+        amplitude_lr: float = 0.1,
     ) -> None:
         super().__init__()
         self.d = hidden_dim
         self.K = k_branches
+        self.tau = temperature
+        self.eps = amplitude_lr
+        context_dim = context_dim or hidden_dim
 
-        # Cross-attention: each branch attends to the token sequence
-        # Query = branch hidden state, Key/Value = token sequence
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-
-        # Context update gate (GRU-style)
-        self.context_gate = nn.GRUCell(hidden_dim, hidden_dim)
-
-        # Entanglement scorer: measures correlation between branch pairs
-        # Used for the entanglement loss term
-        self.entangle_proj = nn.Linear(hidden_dim, hidden_dim // 2)
+        # Project context into branch hidden space for update
+        self.W_ent = nn.Linear(context_dim, hidden_dim, bias=False)
+        # Learnable temperature (can be trained)
+        self.log_tau = nn.Parameter(torch.tensor(math.log(temperature)))
 
     def forward(
         self,
-        state: BranchState,
-        token_sequence: torch.Tensor,  # (batch, seq_len, d)
-        context_memory: torch.Tensor | None = None,  # (batch, K, d)
-    ) -> tuple[BranchState, torch.Tensor]:
+        hidden: torch.Tensor,       # (batch, K, d)
+        amplitudes: torch.Tensor,   # (batch, K, 2)
+        context: torch.Tensor,      # (batch, context_dim)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Update branch hidden states via cross-attention with token sequence.
-        Returns updated BranchState and updated context memory.
-
-        Args:
-            state:          Current BranchState (batch, K, d)
-            token_sequence: Full token embeddings (batch, seq_len, d)
-            context_memory: Previous context memory per branch (batch, K, d)
-                            If None, initialized to zeros.
+        Update branch states via context-branch entanglement.
 
         Returns:
-            (updated_state, new_context_memory)
+            updated_hidden:     (batch, K, d)
+            updated_amplitudes: (batch, K, 2)
         """
-        batch, K, d = state.hidden.shape
-        seq_len = token_sequence.size(1)
+        tau = self.log_tau.exp().clamp(min=0.1, max=10.0)
 
-        if context_memory is None:
-            context_memory = torch.zeros(batch, K, d, device=state.hidden.device)
+        # Step 1: Compatibility scores s_k = ⟨h^(k), c_t⟩ / √d
+        c_proj = self.W_ent(context)                     # (batch, d)
+        c_expanded = c_proj.unsqueeze(1)                 # (batch, 1, d)
+        scores = (hidden * c_expanded).sum(dim=-1) / math.sqrt(self.d)  # (batch, K)
 
-        # Process each branch independently via cross-attention
-        h_updated = []
-        ctx_updated = []
+        # Step 2: Compatibility gates
+        gates = torch.softmax(scores / tau, dim=-1)      # (batch, K)  sums to 1
 
-        for k in range(K):
-            h_k = state.hidden[:, k:k+1, :]  # (batch, 1, d) — query
+        # Step 3: Update hidden states — each branch gets a gated context injection
+        delta_h = gates.unsqueeze(-1) * c_expanded       # (batch, K, d)
+        updated_hidden = hidden + delta_h                # (batch, K, d)
 
-            # Cross-attend to full token sequence
-            h_k_attn, _ = self.cross_attn(
-                query=h_k,
-                key=token_sequence,
-                value=token_sequence,
-            )  # (batch, 1, d)
+        # Step 4: Modulate amplitude magnitudes (preserve phase)
+        a_real = amplitudes[..., 0]                       # (batch, K)
+        a_imag = amplitudes[..., 1]                       # (batch, K)
+        magnitude = (a_real ** 2 + a_imag ** 2).sqrt() + 1e-9  # (batch, K)
+        phase_real = a_real / magnitude
+        phase_imag = a_imag / magnitude
+        # New magnitude: scale by (1 + ε·g_k), then re-normalize to preserve ||α||=1
+        new_magnitude = magnitude * (1.0 + self.eps * gates)
+        # Re-normalize so sum of |α|² stays 1
+        new_magnitude = new_magnitude / (new_magnitude.norm(dim=-1, keepdim=True) + 1e-9)
+        updated_real = new_magnitude * phase_real
+        updated_imag = new_magnitude * phase_imag
+        updated_amplitudes = torch.stack([updated_real, updated_imag], dim=-1)
 
-            h_k_attn = h_k_attn.squeeze(1)  # (batch, d)
+        return updated_hidden, updated_amplitudes
 
-            # Update context memory via GRU gate
-            ctx_k = self.context_gate(h_k_attn, context_memory[:, k, :])  # (batch, d)
-
-            h_updated.append(h_k_attn)
-            ctx_updated.append(ctx_k)
-
-        h_new = torch.stack(h_updated, dim=1)    # (batch, K, d)
-        ctx_new = torch.stack(ctx_updated, dim=1)  # (batch, K, d)
-
-        # Recompute χ from unchanged amplitudes (hidden states changed, not amplitudes)
-        from qrr.branch_bank import BranchState as BS
-        new_state = BS(
-            hidden=h_new,
-            amplitudes=state.amplitudes,
-            probabilities=state.probabilities,
-            chi=state.chi,
-        )
-
-        return new_state, ctx_new
-
-    def entanglement_score(
-        self, state: BranchState
+    def compatibility_scores(
+        self, hidden: torch.Tensor, context: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute pairwise entanglement scores between branches.
-        High score = branches are highly correlated (possibly redundant).
-        Low score = branches are exploring different hypotheses.
-
-        Returns: (batch, K, K) correlation matrix
+        Return raw compatibility scores (pre-softmax) for interpretability.
+        Higher score → branch is more compatible with current observation.
         """
-        h = state.hidden  # (batch, K, d)
-        proj = self.entangle_proj(h)   # (batch, K, d//2)
-        proj_norm = proj / (proj.norm(dim=-1, keepdim=True) + 1e-9)
-        return torch.bmm(proj_norm, proj_norm.transpose(1, 2))  # (batch, K, K)
+        c_proj = self.W_ent(context).unsqueeze(1)        # (batch, 1, d)
+        return (hidden * c_proj).sum(dim=-1) / math.sqrt(self.d)  # (batch, K)

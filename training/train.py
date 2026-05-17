@@ -1,189 +1,159 @@
 """
 QRR Training Loop.
 
-Trains the QRR modules on top of a frozen base transformer.
-Only the QRR modules (BranchBank, UnitaryMixer, AmplitudeRouter,
-EntanglementModule) are updated. The base transformer is frozen.
+Trains the QRR modules (branch bank, mixer, router, entanglement)
+on top of a frozen base transformer.
 
-Training requires an ambiguity-labeled dataset:
-  Each sample: (text, is_ambiguous: bool)
-  'is_ambiguous' drives L_coh and L_dec supervision.
-
-Curriculum:
-  Stage 1 (epochs 1-N): real amplitudes only (phase_scale=0)
-  Stage 2 (epochs N+):  full complex amplitudes with phase shifts
+The base LM is frozen by default — we only train the QRR modules.
+This keeps compute requirements low for Phase 1 experiments.
 
 Usage:
-  python training/train.py --model gpt2 --epochs 20 --batch_size 8
+    python training/train.py \\
+        --model gpt2 \\
+        --k 4 \\
+        --epochs 3 \\
+        --lr 1e-4 \\
+        --batch_size 16 \\
+        --dataset wikitext
 """
 
 from __future__ import annotations
 import argparse
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from transformers import get_linear_schedule_with_warmup
+from datasets import load_dataset
+from tqdm import tqdm
+
 from qrr.qrr_model import QRRModel
 from training.loss import QRRLoss
 
 
-class AmbiguityDataset(Dataset):
-    """
-    Minimal dataset wrapper for (text, is_ambiguous) pairs.
-    Replace with your actual dataset loader.
-    """
-
-    def __init__(self, samples: list[tuple[str, bool]]):
-        self.samples = samples
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> tuple[str, bool]:
-        return self.samples[idx]
-
-
-def collate_fn(batch, tokenizer, max_length=128):
-    texts, labels = zip(*batch)
-    encoding = tokenizer(
-        list(texts),
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    is_ambiguous = torch.tensor(labels, dtype=torch.bool)
-    return encoding["input_ids"], encoding["attention_mask"], is_ambiguous
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train QRR modules")
+    p.add_argument("--model", default="gpt2")
+    p.add_argument("--k", type=int, default=4, help="Number of branches")
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--max_length", type=int, default=128)
+    p.add_argument("--dataset", default="wikitext", choices=["wikitext", "ptb"])
+    p.add_argument("--chi_threshold", type=float, default=0.3)
+    p.add_argument("--lambda_coh", type=float, default=0.1)
+    p.add_argument("--lambda_dec", type=float, default=0.1)
+    p.add_argument("--lambda_div", type=float, default=0.1)
+    p.add_argument("--warmup_steps", type=int, default=100)
+    p.add_argument("--log_every", type=int, default=50)
+    p.add_argument("--save_dir", default="checkpoints")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return p.parse_args()
 
 
-def train(
-    model_name: str = "gpt2",
-    k_branches: int = 4,
-    epochs: int = 20,
-    batch_size: int = 8,
-    lr: float = 1e-4,
-    complex_phase_epoch: int = 10,  # Stage 2 starts here
-    save_dir: str = "checkpoints/qrr_gpt2",
-    lambda_coh: float = 0.1,
-    lambda_dec: float = 0.1,
-    lambda_cal: float = 0.05,
-    lambda_div: float = 0.1,
-) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+def build_dataloader(tokenizer, dataset_name: str, split: str, batch_size: int, max_length: int) -> DataLoader:
+    if dataset_name == "wikitext":
+        raw = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+    else:
+        raw = load_dataset("ptb_text_only", split=split)
 
-    # Load model
-    model = QRRModel(
-        base_model_name=model_name,
-        k_branches=k_branches,
-        freeze_base=True,
-    ).to(device)
-
-    # Only train QRR modules
-    qrr_params = [
-        p for n, p in model.named_parameters()
-        if not n.startswith("base_model.") and p.requires_grad
-    ]
-    print(f"Trainable QRR params: {sum(p.numel() for p in qrr_params):,}")
-
-    optimizer = optim.AdamW(qrr_params, lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = QRRLoss(
-        lambda_coh=lambda_coh,
-        lambda_dec=lambda_dec,
-        lambda_cal=lambda_cal,
-        lambda_div=lambda_div,
-    )
-
-    # Placeholder dataset — replace with real data
-    dummy_samples = [
-        ("The bank was steep and muddy.", True),
-        ("Paris is the capital of France.", False),
-        ("I saw her duck under the table.", True),
-        ("Water boils at 100°C at sea level.", False),
-    ] * 50
-
-    dataset = AmbiguityDataset(dummy_samples)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=lambda b: collate_fn(b, model.tokenizer),
-    )
-
-    print(f"\nStarting training: {epochs} epochs, {len(dataset)} samples")
-    print(f"Stage 1 (real amplitudes): epochs 1-{complex_phase_epoch}")
-    print(f"Stage 2 (complex phases):  epochs {complex_phase_epoch+1}-{epochs}\n")
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-
-        # Curriculum: disable phase shifts in Stage 1
-        if epoch <= complex_phase_epoch:
-            model.amplitude_router.phase_scale = 0.0
-        else:
-            import math
-            model.amplitude_router.phase_scale = math.pi
-
-        total_loss = 0.0
-        loss_terms = {"token": 0., "coh": 0., "dec": 0., "cal": 0., "div": 0.}
-
-        for step, (input_ids, attn_mask, is_ambiguous) in enumerate(loader):
-            input_ids = input_ids.to(device)
-            is_ambiguous = is_ambiguous.to(device)
-
-            optimizer.zero_grad()
-
-            out = model.forward(input_ids, return_branch_states=True)
-            state = out["branch_state"]
-
-            # Shift for next-token prediction
-            logits = out["logits"]   # (batch, vocab)
-            targets = input_ids[:, -1]  # last token as target (simplified)
-
-            losses = criterion(
-                logits=logits,
-                targets=targets,
-                state=state,
-                is_ambiguous=is_ambiguous,
-                decoherence_module=model.decoherence,
-            )
-
-            losses["total"].backward()
-            torch.nn.utils.clip_grad_norm_(qrr_params, max_norm=1.0)
-            optimizer.step()
-
-            total_loss += losses["total"].item()
-            for k in loss_terms:
-                loss_terms[k] += losses[k].item()
-
-        scheduler.step()
-        n = len(loader)
-        stage = "S1" if epoch <= complex_phase_epoch else "S2"
-        print(
-            f"Epoch {epoch:03d}/{epochs} [{stage}] "
-            f"loss={total_loss/n:.4f} "
-            f"tok={loss_terms['token']/n:.4f} "
-            f"coh={loss_terms['coh']/n:.4f} "
-            f"dec={loss_terms['dec']/n:.4f} "
-            f"cal={loss_terms['cal']/n:.4f} "
-            f"div={loss_terms['div']/n:.4f}"
+    def tokenize(batch):
+        return tokenizer(
+            batch["text"], truncation=True, max_length=max_length,
+            padding="max_length", return_tensors="pt"
         )
 
-        # Save checkpoint every 5 epochs
-        if epoch % 5 == 0:
-            model.save_qrr_modules(f"{save_dir}_ep{epoch:03d}")
+    tokenized = raw.map(tokenize, batched=True, remove_columns=["text"])
+    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    return DataLoader(tokenized, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    model.save_qrr_modules(save_dir)
-    print(f"\nTraining complete. Model saved to {save_dir}")
+
+def train_epoch(
+    model: QRRModel,
+    loader: DataLoader,
+    optimizer: optim.Optimizer,
+    scheduler,
+    loss_fn: QRRLoss,
+    device: str,
+    log_every: int,
+) -> dict:
+    model.train()
+    totals = {"total": 0.0, "token": 0.0, "coh": 0.0, "dec": 0.0, "cal": 0.0, "div": 0.0}
+    steps = 0
+
+    for batch in tqdm(loader, desc="Training"):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+        # Targets: next-token prediction (shift right)
+        targets = input_ids[:, 1:].contiguous().view(-1)
+        input_ids_in = input_ids[:, :-1].contiguous()
+        attention_mask_in = attention_mask[:, :-1].contiguous()
+
+        out = model(input_ids_in, attention_mask_in)
+        logits = out["logits"].view(-1, model.output_head.out_features)
+        state = out["branch_state"]
+
+        # Heuristic ambiguity label: chi > 0.5 at initialization ≈ ambiguous
+        # In Phase 3, this will be replaced with dataset-provided labels
+        is_ambiguous = (out["chi"] > 0.5).detach()
+
+        losses = loss_fn(
+            logits, targets, state, is_ambiguous,
+            decoherence_module=model.decoherence
+        )
+
+        optimizer.zero_grad()
+        losses["total"].backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+
+        for k, v in losses.items():
+            totals[k] += v.item()
+        steps += 1
+
+        if steps % log_every == 0:
+            print(f"  step {steps} | " + " | ".join(f"{k}={v/steps:.4f}" for k, v in totals.items()))
+
+    return {k: v / steps for k, v in totals.items()}
+
+
+def main():
+    args = parse_args()
+    print(f"Training QRR | model={args.model} | K={args.k} | device={args.device}")
+
+    model = QRRModel(
+        base_model_name=args.model,
+        k_branches=args.k,
+        chi_threshold=args.chi_threshold,
+        freeze_base=True,
+    ).to(args.device)
+
+    # Only train QRR modules (base is frozen)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(f"Trainable params: {sum(p.numel() for p in trainable):,}")
+
+    optimizer = optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
+    train_loader = build_dataloader(model.tokenizer, args.dataset, "train", args.batch_size, args.max_length)
+    total_steps = len(train_loader) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, args.warmup_steps, total_steps)
+    loss_fn = QRRLoss(
+        lambda_coh=args.lambda_coh,
+        lambda_dec=args.lambda_dec,
+        lambda_div=args.lambda_div,
+    )
+
+    import os
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch {epoch}/{args.epochs}")
+        metrics = train_epoch(model, train_loader, optimizer, scheduler, loss_fn, args.device, args.log_every)
+        print(f"Epoch {epoch} summary: " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+        ckpt = f"{args.save_dir}/qrr_{args.model.replace('/', '_')}_K{args.k}_ep{epoch}.pt"
+        torch.save({"model_state": model.state_dict(), "epoch": epoch, "metrics": metrics}, ckpt)
+        print(f"Saved: {ckpt}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train QRR modules")
-    parser.add_argument("--model", default="gpt2")
-    parser.add_argument("--k_branches", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--save_dir", default="checkpoints/qrr_gpt2")
-    args = parser.parse_args()
-    train(**vars(args))
+    main()

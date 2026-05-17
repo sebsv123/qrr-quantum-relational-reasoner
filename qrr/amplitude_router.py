@@ -1,140 +1,126 @@
 """
-Amplitude Router — complex routing of branch amplitudes.
+Amplitude Router — complex amplitude evolution between branches.
 
-Analog of quantum phase shifts and amplitude redistribution.
-Routes amplitude flow between branches based on semantic compatibility
-between the current token and each branch's hypothesis.
+In QRR, each branch k carries a complex amplitude α^(k) ∈ ℂ.
+The amplitude encodes not just magnitude (probability) but also phase,
+which enables interference: branches with opposite phase cancel;
+branches with aligned phase reinforce.
 
-Key idea: branches that are semantically compatible with the current
-token receive constructive interference (amplitude boost);
-incompatible branches receive destructive interference (amplitude reduction).
+Amplitude update rule:
+  α̃^(k)_{t+1} = Σ_j M_kj(x_t, c_t) · α^(j)_t
 
-This is the QRR analog of:
-  |ψ_new⟩ = M(x_t, c_t) |ψ⟩
-where M is a context-dependent complex mixing matrix.
+where M is a complex-valued K×K routing matrix.
+
+Phase alignment between two branches:
+  cos(θ_k - θ_j) > 0  →  constructive interference
+  cos(θ_k - θ_j) < 0  →  destructive interference
+
+This is the key mechanism that distinguishes QRR from a standard
+Mixture of Experts, which has no phase and therefore no interference.
+
+Curriculum:
+  Stage 1 (early training): imaginary parts zeroed → real-valued MoE.
+  Stage 2 (later training): complex phases activated → full QRR.
 """
 
 from __future__ import annotations
-import math
 import torch
 import torch.nn as nn
-from qrr.branch_bank import BranchState
+import math
 
 
 class AmplitudeRouter(nn.Module):
     """
-    Routes complex amplitudes between branches based on
-    semantic compatibility with the current token.
-
-    Computes a compatibility score s^(k)(x_t) ∈ [-1, 1] for each branch,
-    then applies constructive/destructive interference:
-      α̃^(k) = α^(k) · exp(i · π · s^(k))
+    Context-conditioned complex amplitude router.
 
     Args:
-        hidden_dim:  Branch hidden state dimensionality.
-        token_dim:   Token embedding dimensionality (usually = hidden_dim).
-        k_branches:  Number of branches.
-        phase_scale: Maximum phase shift in radians (default π).
+        k_branches:    Number of branches K.
+        context_dim:   Dimensionality of context vector.
+        use_complex:   If False (Stage 1), imaginary parts are zeroed.
+                       Set to True for Stage 2 (complex phase training).
+        init_scale:    Scale of initial routing weights.
     """
 
     def __init__(
         self,
-        hidden_dim: int,
-        token_dim: int | None = None,
         k_branches: int = 4,
-        phase_scale: float = math.pi,
+        context_dim: int = 768,
+        use_complex: bool = False,
+        init_scale: float = 0.1,
     ) -> None:
         super().__init__()
-        self.d = hidden_dim
         self.K = k_branches
-        self.phase_scale = phase_scale
-        token_dim = token_dim or hidden_dim
+        self.use_complex = use_complex
 
-        # Compatibility scorer: token × branch_hidden → score ∈ [-1, 1]
-        # For each branch k, scores how compatible the current token is
-        self.compat_net = nn.Sequential(
-            nn.Linear(token_dim + hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Tanh(),  # output ∈ (-1, 1)
-        )
+        # Project context → K×K complex routing matrix (real + imag)
+        # Output: 2 * K * K values (real part + imaginary part)
+        self.router_real = nn.Linear(context_dim, k_branches * k_branches)
+        self.router_imag = nn.Linear(context_dim, k_branches * k_branches)
 
-        # Amplitude redistribution: soft cross-branch flow
-        self.flow_net = nn.Sequential(
-            nn.Linear(token_dim, k_branches * k_branches),
-            nn.Softmax(dim=-1),
-        )
+        # Initialize close to identity (branches start independent)
+        nn.init.eye_(self.router_real.weight.view(k_branches * k_branches, -1)[:k_branches * k_branches, :k_branches * k_branches] if context_dim >= k_branches * k_branches else self.router_real.weight)
+        nn.init.zeros_(self.router_real.bias)
+        nn.init.zeros_(self.router_imag.weight)
+        nn.init.zeros_(self.router_imag.bias)
+
+        self._scale = init_scale
 
     def forward(
         self,
-        state: BranchState,
-        token_emb: torch.Tensor,  # (batch, token_dim) — current token embedding
-    ) -> BranchState:
-        """
-        Apply amplitude routing based on current token.
-
-        Args:
-            state:     Current BranchState
-            token_emb: Embedding of current token (batch, token_dim)
-
-        Returns:
-            Updated BranchState with phase-shifted amplitudes
-        """
-        batch = token_emb.size(0)
-        h = state.hidden        # (batch, K, d)
-        alpha = state.amplitudes  # (batch, K, 2)
-
-        # 1. Compute compatibility score for each branch
-        # Expand token to match branches
-        token_exp = token_emb.unsqueeze(1).expand(-1, self.K, -1)  # (batch, K, token_dim)
-        compat_input = torch.cat([token_exp, h], dim=-1)           # (batch, K, token_dim+d)
-        compat_input_flat = compat_input.view(batch * self.K, -1)
-        scores = self.compat_net(compat_input_flat).view(batch, self.K)  # (batch, K) ∈ (-1,1)
-
-        # 2. Phase shift: φ^(k) = phase_scale · s^(k)
-        # Complex multiplication: α · e^{iφ} = (a+ib)(cos φ + i sin φ)
-        phi = self.phase_scale * scores  # (batch, K)
-        cos_phi = phi.cos()              # (batch, K)
-        sin_phi = phi.sin()              # (batch, K)
-
-        a = alpha[..., 0]  # real part (batch, K)
-        b = alpha[..., 1]  # imag part (batch, K)
-
-        # (a + ib)(cos φ + i sin φ) = (a cos φ - b sin φ) + i(a sin φ + b cos φ)
-        a_new = a * cos_phi - b * sin_phi
-        b_new = a * sin_phi + b * cos_phi
-
-        # 3. Cross-branch amplitude flow (redistribution)
-        # Some amplitude flows from one branch to another based on token
-        flow = self.flow_net(token_emb).view(batch, self.K, self.K)  # (batch, K, K)
-        a_new = torch.bmm(flow, a_new.unsqueeze(-1)).squeeze(-1)
-        b_new = torch.bmm(flow, b_new.unsqueeze(-1)).squeeze(-1)
-
-        alpha_new = torch.stack([a_new, b_new], dim=-1)  # (batch, K, 2)
-
-        # 4. Update probabilities and χ
-        norm_sq = a_new ** 2 + b_new ** 2
-        probs_new = norm_sq / (norm_sq.sum(dim=-1, keepdim=True) + 1e-9)
-        chi_new = 1.0 - probs_new.max(dim=-1).values
-
-        from qrr.branch_bank import BranchState
-        return BranchState(
-            hidden=state.hidden,  # hidden states unchanged (mixer handles that)
-            amplitudes=alpha_new,
-            probabilities=probs_new,
-            chi=chi_new,
-        )
-
-    def interference_pattern(
-        self, state: BranchState, token_emb: torch.Tensor
+        amplitudes: torch.Tensor,   # (batch, K, 2) — [real, imag]
+        context: torch.Tensor,      # (batch, context_dim)
     ) -> torch.Tensor:
         """
-        Returns the compatibility scores (phase shifts / π) for visualization.
-        Positive = constructive interference, negative = destructive.
-        Shape: (batch, K)
+        Route complex amplitudes through context-conditioned M.
+
+        Returns: updated amplitudes, shape (batch, K, 2)
         """
-        batch = token_emb.size(0)
-        h = state.hidden
-        token_exp = token_emb.unsqueeze(1).expand(-1, self.K, -1)
-        compat_input = torch.cat([token_exp, h], dim=-1).view(batch * self.K, -1)
-        return self.compat_net(compat_input).view(batch, self.K)
+        batch = context.size(0)
+
+        # Build routing matrix M ∈ ℂ^{K×K}
+        M_real = self.router_real(context).view(batch, self.K, self.K)
+        if self.use_complex:
+            M_imag = self.router_imag(context).view(batch, self.K, self.K)
+        else:
+            M_imag = torch.zeros_like(M_real)
+
+        # Normalize M rows to prevent amplitude explosion
+        M_norm = (M_real ** 2 + M_imag ** 2).sum(dim=-1, keepdim=True).sqrt() + 1e-9
+        M_real = M_real / M_norm
+        M_imag = M_imag / M_norm
+
+        # Extract input real and imaginary parts
+        a_real = amplitudes[..., 0]  # (batch, K)
+        a_imag = amplitudes[..., 1]  # (batch, K)
+
+        # Complex matrix-vector multiply:
+        # (M_real + i·M_imag)(a_real + i·a_imag)
+        # = (M_real·a_real - M_imag·a_imag) + i(M_real·a_imag + M_imag·a_real)
+        out_real = (torch.bmm(M_real, a_real.unsqueeze(-1)).squeeze(-1)
+                    - torch.bmm(M_imag, a_imag.unsqueeze(-1)).squeeze(-1))
+        out_imag = (torch.bmm(M_real, a_imag.unsqueeze(-1)).squeeze(-1)
+                    + torch.bmm(M_imag, a_real.unsqueeze(-1)).squeeze(-1))
+
+        return torch.stack([out_real, out_imag], dim=-1)  # (batch, K, 2)
+
+    def phase_interference_map(
+        self, amplitudes: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute K×K matrix of cosine phase differences between all branch pairs.
+        Values > 0: constructive interference.
+        Values < 0: destructive interference.
+
+        Returns: (batch, K, K) cosine similarity of phases.
+        """
+        a_real = amplitudes[..., 0]  # (batch, K)
+        a_imag = amplitudes[..., 1]  # (batch, K)
+        # Phase angle θ_k = atan2(imag, real)
+        phases = torch.atan2(a_imag, a_real)  # (batch, K)
+        # cos(θ_k - θ_j) via outer difference
+        diff = phases.unsqueeze(2) - phases.unsqueeze(1)  # (batch, K, K)
+        return torch.cos(diff)
+
+    def activate_complex_phases(self) -> None:
+        """Switch from Stage 1 (real) to Stage 2 (complex). Call after Stage 1 convergence."""
+        self.use_complex = True

@@ -1,96 +1,103 @@
 """
-Training Curriculum for QRR.
+Curriculum Scheduler for QRR training.
 
-Stage 1 — Real Amplitudes:
-  Phase scale = 0 → amplitude router applies no phase shifts.
-  This trains the BranchBank and UnitaryMixer to maintain
-  diverse branches using only real-valued amplitude weights.
-  Analogous to classical probability mixture.
+Stage 1 (real amplitudes): Train branch bank, mixer, entanglement, and
+  decoherence with real-valued amplitudes only. The model learns to
+  maintain and select between branches without phase information.
+  Equivalent to a structured Mixture of Experts with coherent evolution.
 
-Stage 2 — Complex Phase Introduction:
-  Phase scale ramps from 0 to π over N epochs.
-  Amplitude router now applies genuine complex phase shifts,
-  enabling constructive and destructive interference.
-  This is the key step that distinguishes QRR from a simple ensemble.
+Stage 2 (complex phases): Activate imaginary parts of the AmplitudeRouter.
+  The model now has full complex amplitudes. Branches can interfere
+  constructively (aligned phases) or destructively (opposite phases).
+  This is where QRR becomes strictly more expressive than MoE.
 
-Stage 3 (optional) — Dynamic Phase Scale:
-  Phase scale itself becomes a learned parameter,
-  conditioned on the input distribution.
-
-Rationale:
-  Training directly with complex amplitudes is unstable (loss landscape
-  has saddle points where destructive interference kills gradients).
-  Warm-starting with real amplitudes gives the branch bank time to
-  develop diverse hidden states before phase shifts are introduced.
+Transition criterion:
+  Switch to Stage 2 when Stage 1 training shows:
+  1. L_coh < 0.05 (model can maintain branches on ambiguous inputs)
+  2. L_dec < 0.05 (model can collapse cleanly on clear inputs)
+  3. Δχ > 0.10 on validation set (χ has some discriminative signal)
 """
 
 from __future__ import annotations
-import math
+import torch
 from qrr.qrr_model import QRRModel
 
 
-class QRRCurriculum:
+class CurriculumScheduler:
     """
-    Manages the training curriculum for QRR.
+    Manages the Stage 1 → Stage 2 transition.
 
     Args:
-        model:               QRRModel instance.
-        total_epochs:        Total training epochs.
-        stage2_start_frac:   Fraction of epochs before Stage 2 begins (default 0.5).
-        stage2_ramp_frac:    Fraction of epochs over which phase ramps from 0 to π.
+        model:          QRRModel instance.
+        transition_step: Force transition at this step regardless of criteria.
+        l_coh_threshold: Max L_coh to allow transition (default 0.05).
+        l_dec_threshold: Max L_dec to allow transition (default 0.05).
+        delta_chi_min:   Min Δχ on validation to allow transition (default 0.10).
     """
 
     def __init__(
         self,
         model: QRRModel,
-        total_epochs: int,
-        stage2_start_frac: float = 0.5,
-        stage2_ramp_frac: float = 0.2,
+        transition_step: int = 5000,
+        l_coh_threshold: float = 0.05,
+        l_dec_threshold: float = 0.05,
+        delta_chi_min: float = 0.10,
     ) -> None:
         self.model = model
-        self.total_epochs = total_epochs
-        self.stage2_start = int(total_epochs * stage2_start_frac)
-        self.stage2_ramp_end = self.stage2_start + int(total_epochs * stage2_ramp_frac)
+        self.transition_step = transition_step
+        self.l_coh_thr = l_coh_threshold
+        self.l_dec_thr = l_dec_threshold
+        self.delta_chi_min = delta_chi_min
+        self.stage = 1
+        self._step = 0
+        self._transition_log: list[dict] = []
 
-    def step(self, epoch: int) -> dict:
+    def step(
+        self,
+        l_coh: float,
+        l_dec: float,
+        delta_chi: float,
+    ) -> bool:
         """
-        Update model curriculum state for given epoch.
-        Returns a dict describing the current curriculum stage.
+        Call each training step. Returns True if transition just occurred.
+
+        Args:
+            l_coh:     Current coherence loss.
+            l_dec:     Current decoherence loss.
+            delta_chi: Current Δχ on validation set.
         """
-        if epoch < self.stage2_start:
-            # Stage 1: real amplitudes
-            self.model.amplitude_router.phase_scale = 0.0
-            stage = 1
-            phase_scale = 0.0
-            description = "Real amplitudes only — training branch diversity"
+        self._step += 1
+        if self.stage == 2:
+            return False
 
-        elif epoch < self.stage2_ramp_end:
-            # Stage 2 ramp: linearly increase phase scale from 0 to π
-            progress = (epoch - self.stage2_start) / max(
-                self.stage2_ramp_end - self.stage2_start, 1
-            )
-            phase_scale = progress * math.pi
-            self.model.amplitude_router.phase_scale = phase_scale
-            stage = 2
-            description = f"Phase ramp: {phase_scale:.3f} rad ({progress*100:.0f}% of π)"
-
-        else:
-            # Stage 2 full: complete complex amplitudes
-            self.model.amplitude_router.phase_scale = math.pi
-            phase_scale = math.pi
-            stage = 2
-            description = "Full complex amplitudes — interference active"
-
-        return {
-            "stage": stage,
-            "epoch": epoch,
-            "phase_scale": phase_scale,
-            "description": description,
-        }
-
-    def log(self, epoch: int) -> str:
-        state = self.step(epoch)
-        return (
-            f"[Curriculum] Epoch {epoch}/{self.total_epochs} "
-            f"Stage {state['stage']} — {state['description']}"
+        criteria_met = (
+            l_coh < self.l_coh_thr
+            and l_dec < self.l_dec_thr
+            and delta_chi > self.delta_chi_min
         )
+        forced = self._step >= self.transition_step
+
+        if criteria_met or forced:
+            self._activate_stage2(forced=forced, l_coh=l_coh, l_dec=l_dec, delta_chi=delta_chi)
+            return True
+
+        return False
+
+    def _activate_stage2(self, forced: bool, **metrics) -> None:
+        """Activate complex phases in the AmplitudeRouter."""
+        self.model.router.activate_complex_phases()
+        self.stage = 2
+        record = {"step": self._step, "forced": forced, **metrics}
+        self._transition_log.append(record)
+        reason = "forced" if forced else "criteria met"
+        print(f"\n[Curriculum] Stage 1 → Stage 2 at step {self._step} ({reason})")
+        print(f"  l_coh={metrics.get('l_coh', 0):.4f}  l_dec={metrics.get('l_dec', 0):.4f}  Δχ={metrics.get('delta_chi', 0):.4f}")
+        print("  Complex phases activated. Interference is now live.\n")
+
+    @property
+    def in_stage1(self) -> bool:
+        return self.stage == 1
+
+    @property
+    def in_stage2(self) -> bool:
+        return self.stage == 2
