@@ -1,187 +1,242 @@
 """
-Ambiguity Benchmark (EXP-001).
+Ambiguity Benchmark — EXP-001.
 
-Measures whether QRR's collapse index χ discriminates between
-ambiguous and unambiguous inputs without any fine-tuning.
+Tests whether QRR's collapse index χ discriminates semantically ambiguous
+inputs from clear ones, without any fine-tuning.
+
+Hypothesis: Mean χ(ambiguous) − Mean χ(clear) > 0.15
+Success criterion: Δχ > 0.15, p < 0.05 (Mann-Whitney U)
 
 Usage:
-    python benchmarks/ambiguity_bench.py --model gpt2 --branches 4
-
-Success criterion (from ROADMAP.md):
-    Δχ = mean(χ_ambiguous) - mean(χ_clear) > 0.15, p < 0.05
+    python benchmarks/ambiguity_bench.py
+    python benchmarks/ambiguity_bench.py --model gpt2 --branches 4 --output experiments/EXP-001_results.json
 """
 
 from __future__ import annotations
 import argparse
-import torch
+import json
+import time
+from pathlib import Path
 import numpy as np
 from scipy import stats
-from tqdm import tqdm
+import torch
 from qrr.qrr_model import QRRModel
 
+# ---------------------------------------------------------------------------
+# Built-in dataset (no external downloads required for first run)
+# ---------------------------------------------------------------------------
 
-# --- Curated dataset ---
-# 30 ambiguous + 30 clear sentences for quick local testing.
-# For the full EXP-001 run, replace with AmbigQA dataset loader.
-
-AMBIGUOUS_SENTENCES = [
+AMBIGUOUS_INPUTS = [
     # Lexical ambiguity
-    "The bank was steep.",
-    "I went to the bank yesterday.",
-    "He saw her duck.",
-    "She can't bear children.",
-    "The chicken is ready to eat.",
-    "Time flies like an arrow.",
-    "I saw the man with the binoculars.",
-    "Visiting relatives can be annoying.",
-    "The professor said on Monday he would give the exam.",
-    "I need more time to understand the problem.",
+    "The bank was steep and covered in moss.",
+    "She couldn't bear the weight of the news.",
+    "I saw the bat in the cave.",
+    "The pitcher was left on the mound.",
+    "He spotted the duck near the pond.",
+    "The crane stood perfectly still by the water.",
+    "The bark was rough and peeling.",
+    "They found the spring behind the old house.",
+    "The match was over in minutes.",
+    "She left her address at the counter.",
     # Structural ambiguity
-    "I saw the man on the hill with a telescope.",
+    "I saw the man with the telescope.",
+    "The chicken is ready to eat.",
+    "Visiting relatives can be boring.",
+    "The professor urged the students to study harder in her office.",
     "The horse raced past the barn fell.",
-    "Book the flight or the hotel first.",
-    "The old men and women left the room.",
-    "Police police police police police.",
+    "I know a taller man than John.",
+    "She told him that she loved him every day.",
+    "They are cooking apples.",
+    "The government plans to raise taxes next year or the opposition will.",
+    "He fed the dog the bone near the fence.",
     # Referential ambiguity
-    "John told Peter that he had won.",
-    "The committee approved the proposal after its review.",
-    "Mary said she was tired, and Susan agreed.",
-    "Call me a cab and I'll be happy.",
-    "I know more beautiful cities than Paris.",
-    # Pragmatic ambiguity
-    "Can you open the window?",
-    "Do you have the time?",
-    "It's cold in here.",
-    "Would you like some coffee?",
-    "Could you pass the salt?",
-    # Multi-sense words
-    "The crane was at the construction site.",
-    "She hit the nail on the head.",
-    "The light was too bright.",
-    "He left in a rush.",
-    "The pool was full.",
+    "John told Mark that he had won.",
+    "The trophy didn't fit in the bag because it was too big.",
+    "The city council refused the demonstrators a permit because they feared violence.",
+    "Mary said she would come, but she didn't.",
+    "The old man and his son walked to the river. He was exhausted.",
+    # Intent ambiguity
+    "Book the flight or the hotel first.",
+    "Call me when you arrive or if there's a problem.",
+    "Can you pass the salt?",
+    "Would you mind closing the window?",
+    "Do you know what time it is?",
 ]
 
-CLEAR_SENTENCES = [
+CLEAR_INPUTS = [
     # Unambiguous factual statements
     "Water boils at 100 degrees Celsius at sea level.",
-    "The Eiffel Tower is located in Paris, France.",
-    "Python is a programming language created in 1991.",
-    "The speed of light is approximately 299,792 kilometers per second.",
-    "The human body has 206 bones.",
-    "Carbon dioxide is composed of one carbon and two oxygen atoms.",
-    "The Earth revolves around the Sun once per year.",
-    "Shakespeare wrote Hamlet in approximately 1600.",
-    "The boiling point of water decreases at higher altitudes.",
-    "DNA stands for deoxyribonucleic acid.",
-    "The Amazon river is the largest river by discharge volume.",
-    "Photosynthesis converts sunlight into glucose.",
-    "The Pythagorean theorem states that a² + b² = c².",
-    "Mammals are warm-blooded vertebrates.",
-    "The capital of Japan is Tokyo.",
-    "Hydrogen is the lightest element on the periodic table.",
-    "The Great Wall of China is over 13,000 miles long.",
-    "Gravity causes objects to fall toward the Earth.",
-    "The mitochondria is the powerhouse of the cell.",
-    "The speed of sound in air is approximately 343 meters per second.",
-    "Rome was not built in a day.",
-    "The moon orbits the Earth every 27.3 days.",
-    "Penguins are flightless birds native to the Southern Hemisphere.",
-    "The currency of Japan is the yen.",
-    "Albert Einstein published the special theory of relativity in 1905.",
-    "The Sahara is the largest hot desert on Earth.",
-    "Oxygen has atomic number 8 on the periodic table.",
-    "The brain is the most complex organ in the human body.",
-    "TCP/IP is the foundational protocol of the internet.",
-    "The binary system uses only the digits 0 and 1.",
+    "The capital of France is Paris.",
+    "The Earth orbits the Sun once per year.",
+    "Photosynthesis converts sunlight into chemical energy.",
+    "The speed of light in a vacuum is approximately 299,792 kilometers per second.",
+    "Humans have 46 chromosomes arranged in 23 pairs.",
+    "The Amazon River is the largest river in the world by discharge volume.",
+    "World War II ended in 1945.",
+    "Sodium chloride is the chemical compound commonly known as table salt.",
+    "The Pythagorean theorem states that a squared plus b squared equals c squared.",
+    # Clear procedural statements
+    "To make tea, boil water and steep the tea bag for three minutes.",
+    "Press the power button to turn on the device.",
+    "Add the flour, then mix until smooth.",
+    "The function returns the sum of its two integer arguments.",
+    "Click the submit button to send the form.",
+    "Open the file, read its contents, then close it.",
+    "Sort the array in ascending order before returning it.",
+    "Connect the red wire to the positive terminal.",
+    "Divide the total by the number of participants to get the average.",
+    "Save the document before closing the application.",
+    # Clear descriptive statements
+    "The red car was parked outside the building.",
+    "She opened the door and walked inside.",
+    "The meeting starts at 3 PM on Tuesday.",
+    "The package weighs exactly 2.5 kilograms.",
+    "There are seven days in a week.",
+    "The project deadline is the last Friday of the month.",
+    "He ran 10 kilometers in 45 minutes.",
+    "The temperature dropped below zero overnight.",
+    "The report has twelve pages and three appendices.",
+    "The train departs at 08:15 from platform 4.",
 ]
 
 
 def load_ambiguity_dataset(n: int = 30) -> tuple[list[str], list[str]]:
-    """Return up to n ambiguous and n clear sentences."""
-    return AMBIGUOUS_SENTENCES[:n], CLEAR_SENTENCES[:n]
+    """Return up to n ambiguous and n clear samples."""
+    return AMBIGUOUS_INPUTS[:n], CLEAR_INPUTS[:n]
 
 
-def run_benchmark(model: QRRModel, n: int = 30) -> dict:
-    ambiguous, clear = load_ambiguity_dataset(n)
-    chi_amb, chi_clr = [], []
+def run_exp001(
+    model_name: str = "gpt2",
+    k_branches: int = 4,
+    n_samples: int = 30,
+    output_path: str | None = None,
+    verbose: bool = True,
+) -> dict:
+    """
+    Run EXP-001: χ discrimination benchmark.
 
+    Returns results dict with all metrics.
+    """
+    if verbose:
+        print(f"\n{'='*60}")
+        print("EXP-001: QRR χ Discrimination Benchmark")
+        print(f"{'='*60}")
+        print(f"Model:    {model_name}")
+        print(f"Branches: K={k_branches}")
+        print(f"Samples:  {n_samples} ambiguous + {n_samples} clear")
+        print()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if verbose:
+        print(f"Device: {device}")
+        print("Loading model...")
+
+    t0 = time.time()
+    model = QRRModel(
+        base_model_name=model_name,
+        k_branches=k_branches,
+        freeze_base=True,
+    ).to(device)
     model.eval()
-    with torch.no_grad():
-        for text in tqdm(ambiguous, desc="Ambiguous"):
-            r = model.forward_with_branches(text)
-            chi_amb.append(r["chi"])
-        for text in tqdm(clear, desc="Clear"):
-            r = model.forward_with_branches(text)
-            chi_clr.append(r["chi"])
 
-    chi_amb = np.array(chi_amb)
-    chi_clr = np.array(chi_clr)
-    delta_chi = chi_amb.mean() - chi_clr.mean()
-    _, p_value = stats.mannwhitneyu(chi_amb, chi_clr, alternative="greater")
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"QRR trainable params: {n_params:,}")
+        print(f"Model loaded in {time.time()-t0:.1f}s")
+        print()
+
+    ambiguous, clear = load_ambiguity_dataset(n_samples)
+    chi_ambiguous, chi_clear = [], []
+    diversity_ambiguous, diversity_clear = [], []
+
+    if verbose:
+        print("Computing χ for ambiguous inputs...")
+    for i, prompt in enumerate(ambiguous):
+        with torch.no_grad():
+            out = model.forward_with_branches(prompt)
+        chi_ambiguous.append(out["chi"])
+        diversity_ambiguous.append(out["branch_diversity"])
+        if verbose and i % 10 == 0:
+            print(f"  [{i+1:02d}/{n_samples}] '{prompt[:50]}...' χ={out['chi']:.3f}")
+
+    if verbose:
+        print("\nComputing χ for clear inputs...")
+    for i, prompt in enumerate(clear):
+        with torch.no_grad():
+            out = model.forward_with_branches(prompt)
+        chi_clear.append(out["chi"])
+        diversity_clear.append(out["branch_diversity"])
+        if verbose and i % 10 == 0:
+            print(f"  [{i+1:02d}/{n_samples}] '{prompt[:50]}...' χ={out['chi']:.3f}")
+
+    # Statistical analysis
+    chi_a = np.array(chi_ambiguous)
+    chi_c = np.array(chi_clear)
+    delta_chi = chi_a.mean() - chi_c.mean()
+    u_stat, p_value = stats.mannwhitneyu(chi_a, chi_c, alternative="greater")
+    success = delta_chi > 0.15 and p_value < 0.05
 
     results = {
-        "chi_ambiguous_mean": float(chi_amb.mean()),
-        "chi_ambiguous_std":  float(chi_amb.std()),
-        "chi_clear_mean":     float(chi_clr.mean()),
-        "chi_clear_std":      float(chi_clr.std()),
+        "experiment": "EXP-001",
+        "model": model_name,
+        "k_branches": k_branches,
+        "n_samples": n_samples,
+        "chi_ambiguous_mean": float(chi_a.mean()),
+        "chi_ambiguous_std":  float(chi_a.std()),
+        "chi_clear_mean":     float(chi_c.mean()),
+        "chi_clear_std":      float(chi_c.std()),
         "delta_chi":          float(delta_chi),
+        "mann_whitney_u":     float(u_stat),
         "p_value":            float(p_value),
-        "success":            bool(delta_chi > 0.15 and p_value < 0.05),
-        "n_ambiguous":        len(chi_amb),
-        "n_clear":            len(chi_clr),
+        "success_criterion":  "> 0.15 delta_chi AND p < 0.05",
+        "success":            bool(success),
+        "diversity_ambiguous_mean": float(np.mean(diversity_ambiguous)),
+        "diversity_clear_mean":     float(np.mean(diversity_clear)),
     }
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print("RESULTS")
+        print(f"{'='*60}")
+        print(f"  χ ambiguous:  {results['chi_ambiguous_mean']:.4f} ± {results['chi_ambiguous_std']:.4f}")
+        print(f"  χ clear:      {results['chi_clear_mean']:.4f} ± {results['chi_clear_std']:.4f}")
+        print(f"  Δχ:           {delta_chi:.4f}  (need > 0.15)")
+        print(f"  p-value:      {p_value:.4f}  (need < 0.05)")
+        print(f"  Diversity Δ:  {np.mean(diversity_ambiguous) - np.mean(diversity_clear):.4f}")
+        print()
+        if success:
+            print("  ✅ SUCCESS — χ discriminates ambiguous from clear inputs.")
+            print("     → Proceed to Phase 2: UnitaryMixer + complex phases.")
+        elif delta_chi > 0.05:
+            print("  ⚠️  PARTIAL — Δχ > 0.05 but criterion not fully met.")
+            print("     → Try K=8 branches or adjust amplitude router.")
+        else:
+            print("  ❌ FAILED — χ shows no discrimination signal.")
+            print("     → Revisit branch initialization and router design.")
+        print(f"{'='*60}\n")
+
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w") as f:
+            json.dump(results, f, indent=2)
+        if verbose:
+            print(f"Results saved to {output_path}")
+
     return results
 
 
-def print_results(results: dict) -> None:
-    print("\n" + "=" * 60)
-    print("EXP-001: χ Discrimination Benchmark")
-    print("=" * 60)
-    print(f"  χ ambiguous : mean={results['chi_ambiguous_mean']:.3f}  std={results['chi_ambiguous_std']:.3f}")
-    print(f"  χ clear     : mean={results['chi_clear_mean']:.3f}  std={results['chi_clear_std']:.3f}")
-    print(f"  Δχ          : {results['delta_chi']:+.3f}")
-    print(f"  p-value     : {results['p_value']:.4f}")
-    print(f"  n           : {results['n_ambiguous']} ambiguous / {results['n_clear']} clear")
-    print("-" * 60)
-    if results["success"]:
-        print("  ✅ SUCCESS: Δχ > 0.15 and p < 0.05")
-        print("     χ discriminates ambiguous vs clear inputs.")
-        print("     Proceed to Phase 2 (UnitaryMixer + complex phases).")
-    elif results["delta_chi"] > 0.05:
-        print("  ⚠️  PARTIAL: Δχ > 0.05 but below 0.15 threshold.")
-        print("     Signal is present but weak. Tune K, χ_threshold, or init.")
-    else:
-        print("  ❌ FAIL: Δχ ≤ 0.05. χ carries no discriminative signal.")
-        print("     Revisit amplitude router design (see CRITIQUE.md).")
-    print("=" * 60)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="EXP-001: χ Discrimination Benchmark")
-    parser.add_argument("--model", default="gpt2")
-    parser.add_argument("--branches", type=int, default=4)
-    parser.add_argument("--n", type=int, default=30, help="Samples per class")
-    parser.add_argument("--chi_threshold", type=float, default=0.3)
-    parser.add_argument("--save_json", type=str, default="", help="Path to save results JSON")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="EXP-001: QRR χ Discrimination Benchmark")
+    parser.add_argument("--model",   default="gpt2",  help="HuggingFace model name")
+    parser.add_argument("--branches", type=int, default=4, help="Number of QRR branches K")
+    parser.add_argument("--samples",  type=int, default=30, help="Samples per category")
+    parser.add_argument("--output",  default="experiments/EXP-001_results.json", help="Output JSON path")
     args = parser.parse_args()
 
-    print(f"Loading QRR [{args.model}, K={args.branches}]...")
-    model = QRRModel(
-        base_model_name=args.model,
+    run_exp001(
+        model_name=args.model,
         k_branches=args.branches,
-        chi_threshold=args.chi_threshold,
+        n_samples=args.samples,
+        output_path=args.output,
+        verbose=True,
     )
-
-    results = run_benchmark(model, n=args.n)
-    print_results(results)
-
-    if args.save_json:
-        import json
-        with open(args.save_json, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"\nResults saved to {args.save_json}")
-
-
-if __name__ == "__main__":
-    main()

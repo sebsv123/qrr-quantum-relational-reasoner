@@ -1,26 +1,17 @@
 """
-Amplitude Router — complex amplitude evolution between branches.
+Amplitude Router — context-conditioned complex amplitude update.
 
-In QRR, each branch k carries a complex amplitude α^(k) ∈ ℂ.
-The amplitude encodes not just magnitude (probability) but also phase,
-which enables interference: branches with opposite phase cancel;
-branches with aligned phase reinforce.
+After UnitaryMixer evolves the branch bank, the AmplitudeRouter updates
+the complex amplitudes based on new evidence from the current token
+and accumulated context.
 
-Amplitude update rule:
-  α̃^(k)_{t+1} = Σ_j M_kj(x_t, c_t) · α^(j)_t
+This is the module responsible for constructive and destructive interference:
+  - Branches consistent with new evidence get amplified
+  - Branches inconsistent with new evidence get suppressed
 
-where M is a complex-valued K×K routing matrix.
-
-Phase alignment between two branches:
-  cos(θ_k - θ_j) > 0  →  constructive interference
-  cos(θ_k - θ_j) < 0  →  destructive interference
-
-This is the key mechanism that distinguishes QRR from a standard
-Mixture of Experts, which has no phase and therefore no interference.
-
-Curriculum:
-  Stage 1 (early training): imaginary parts zeroed → real-valued MoE.
-  Stage 2 (later training): complex phases activated → full QRR.
+The router operates in the complex domain:
+  α^(k)_{t+1} = router(h^(k)_t, x_t, c_t) * α^(k)_t
+where router output is a complex gain in polar form (magnitude ∈ [0,1], phase ∈ [-π, π]).
 """
 
 from __future__ import annotations
@@ -31,96 +22,128 @@ import math
 
 class AmplitudeRouter(nn.Module):
     """
-    Context-conditioned complex amplitude router.
+    Updates complex amplitudes based on branch-context compatibility.
+
+    For each branch k, computes a complex gain g^(k) = r^(k) * e^{iθ^(k)}:
+      r^(k) ∈ [0,1]  — magnitude: how much this branch is supported by evidence
+      θ^(k) ∈ [-π,π] — phase:     interference angle with other branches
 
     Args:
-        k_branches:    Number of branches K.
-        context_dim:   Dimensionality of context vector.
-        use_complex:   If False (Stage 1), imaginary parts are zeroed.
-                       Set to True for Stage 2 (complex phase training).
-        init_scale:    Scale of initial routing weights.
+        hidden_dim:   Dimensionality of branch hidden states.
+        k_branches:   Number of branches K.
+        context_dim:  Dimensionality of conditioning context.
+        use_phase:    If True, compute full complex gain with phase (Stage 2).
+                      If False, use real-valued gain only (Stage 1 curriculum).
     """
 
     def __init__(
         self,
-        k_branches: int = 4,
-        context_dim: int = 768,
-        use_complex: bool = False,
-        init_scale: float = 0.1,
+        hidden_dim: int,
+        k_branches: int,
+        context_dim: int | None = None,
+        use_phase: bool = False,
     ) -> None:
         super().__init__()
+        self.d = hidden_dim
         self.K = k_branches
-        self.use_complex = use_complex
+        self.context_dim = context_dim or hidden_dim
+        self.use_phase = use_phase
 
-        # Project context → K×K complex routing matrix (real + imag)
-        # Output: 2 * K * K values (real part + imaginary part)
-        self.router_real = nn.Linear(context_dim, k_branches * k_branches)
-        self.router_imag = nn.Linear(context_dim, k_branches * k_branches)
+        # Compatibility scorer: how well does branch k explain current evidence?
+        # Input: [h^(k), context] → scalar compatibility score
+        self.compatibility = nn.Sequential(
+            nn.Linear(hidden_dim + self.context_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
 
-        # Initialize close to identity (branches start independent)
-        nn.init.eye_(self.router_real.weight.view(k_branches * k_branches, -1)[:k_branches * k_branches, :k_branches * k_branches] if context_dim >= k_branches * k_branches else self.router_real.weight)
-        nn.init.zeros_(self.router_real.bias)
-        nn.init.zeros_(self.router_imag.weight)
-        nn.init.zeros_(self.router_imag.bias)
-
-        self._scale = init_scale
+        if use_phase:
+            # Phase predictor: context → phase per branch
+            self.phase_net = nn.Sequential(
+                nn.Linear(hidden_dim + self.context_dim, hidden_dim // 4),
+                nn.Tanh(),
+                nn.Linear(hidden_dim // 4, 1),
+            )
 
     def forward(
         self,
-        amplitudes: torch.Tensor,   # (batch, K, 2) — [real, imag]
-        context: torch.Tensor,      # (batch, context_dim)
+        hidden: torch.Tensor,      # (batch, K, d)
+        amplitudes: torch.Tensor,  # (batch, K, 2) — [real, imag]
+        context: torch.Tensor,     # (batch, context_dim)
     ) -> torch.Tensor:
         """
-        Route complex amplitudes through context-conditioned M.
+        Compute updated complex amplitudes.
 
-        Returns: updated amplitudes, shape (batch, K, 2)
+        Args:
+            hidden:     Current branch hidden states (batch, K, d)
+            amplitudes: Current complex amplitudes (batch, K, 2)
+            context:    Current token context from base transformer (batch, context_dim)
+
+        Returns:
+            new_amplitudes: (batch, K, 2) — updated [real, imag]
         """
-        batch = context.size(0)
+        batch = hidden.size(0)
 
-        # Build routing matrix M ∈ ℂ^{K×K}
-        M_real = self.router_real(context).view(batch, self.K, self.K)
-        if self.use_complex:
-            M_imag = self.router_imag(context).view(batch, self.K, self.K)
+        # Expand context to match K branches
+        ctx = context.unsqueeze(1).expand(-1, self.K, -1)  # (batch, K, context_dim)
+
+        # Compute compatibility score per branch
+        gate_input = torch.cat([hidden, ctx], dim=-1)         # (batch, K, d+ctx)
+        compat = self.compatibility(gate_input).squeeze(-1)   # (batch, K)
+        magnitude = torch.sigmoid(compat)                     # r^(k) ∈ (0, 1)
+
+        if self.use_phase:
+            # Stage 2: full complex gain with phase
+            raw_phase = self.phase_net(gate_input).squeeze(-1)  # (batch, K)
+            phase = raw_phase * math.pi                          # θ^(k) ∈ (-π, π)
+
+            # Complex multiplication: (α_r + iα_i) * r*(cosθ + i*sinθ)
+            amp_r = amplitudes[..., 0]   # (batch, K)
+            amp_i = amplitudes[..., 1]   # (batch, K)
+            gain_r = magnitude * torch.cos(phase)
+            gain_i = magnitude * torch.sin(phase)
+
+            new_amp_r = amp_r * gain_r - amp_i * gain_i
+            new_amp_i = amp_r * gain_i + amp_i * gain_r
         else:
-            M_imag = torch.zeros_like(M_real)
+            # Stage 1: real-valued gain only (simpler, more stable to train)
+            new_amp_r = amplitudes[..., 0] * magnitude
+            new_amp_i = amplitudes[..., 1] * magnitude
 
-        # Normalize M rows to prevent amplitude explosion
-        M_norm = (M_real ** 2 + M_imag ** 2).sum(dim=-1, keepdim=True).sqrt() + 1e-9
-        M_real = M_real / M_norm
-        M_imag = M_imag / M_norm
+        new_amplitudes = torch.stack([new_amp_r, new_amp_i], dim=-1)  # (batch, K, 2)
 
-        # Extract input real and imaginary parts
-        a_real = amplitudes[..., 0]  # (batch, K)
-        a_imag = amplitudes[..., 1]  # (batch, K)
+        # Renormalize to prevent amplitude collapse
+        norm_sq = (new_amp_r ** 2 + new_amp_i ** 2).sum(dim=-1, keepdim=True) + 1e-9
+        scale = (1.0 / norm_sq.sqrt()).unsqueeze(-1)  # broadcast over K and 2
+        # Only scale amplitude magnitudes, not hidden states
+        norms = (new_amp_r ** 2 + new_amp_i ** 2 + 1e-9).sqrt()  # (batch, K)
+        total_norm = norms.sum(dim=-1, keepdim=True)               # (batch, 1)
+        new_amp_r = new_amp_r / total_norm
+        new_amp_i = new_amp_i / total_norm
+        new_amplitudes = torch.stack([new_amp_r, new_amp_i], dim=-1)
 
-        # Complex matrix-vector multiply:
-        # (M_real + i·M_imag)(a_real + i·a_imag)
-        # = (M_real·a_real - M_imag·a_imag) + i(M_real·a_imag + M_imag·a_real)
-        out_real = (torch.bmm(M_real, a_real.unsqueeze(-1)).squeeze(-1)
-                    - torch.bmm(M_imag, a_imag.unsqueeze(-1)).squeeze(-1))
-        out_imag = (torch.bmm(M_real, a_imag.unsqueeze(-1)).squeeze(-1)
-                    + torch.bmm(M_imag, a_real.unsqueeze(-1)).squeeze(-1))
+        return new_amplitudes
 
-        return torch.stack([out_real, out_imag], dim=-1)  # (batch, K, 2)
-
-    def phase_interference_map(
-        self, amplitudes: torch.Tensor
-    ) -> torch.Tensor:
+    def interference_pattern(
+        self,
+        amplitudes_before: torch.Tensor,
+        amplitudes_after: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         """
-        Compute K×K matrix of cosine phase differences between all branch pairs.
-        Values > 0: constructive interference.
-        Values < 0: destructive interference.
+        Diagnostic: measure how much constructive vs destructive interference occurred.
 
-        Returns: (batch, K, K) cosine similarity of phases.
+        Returns dict with:
+          'constructive': fraction of branches that gained amplitude
+          'destructive':  fraction of branches that lost amplitude
+          'net_change':   mean amplitude magnitude change
         """
-        a_real = amplitudes[..., 0]  # (batch, K)
-        a_imag = amplitudes[..., 1]  # (batch, K)
-        # Phase angle θ_k = atan2(imag, real)
-        phases = torch.atan2(a_imag, a_real)  # (batch, K)
-        # cos(θ_k - θ_j) via outer difference
-        diff = phases.unsqueeze(2) - phases.unsqueeze(1)  # (batch, K, K)
-        return torch.cos(diff)
-
-    def activate_complex_phases(self) -> None:
-        """Switch from Stage 1 (real) to Stage 2 (complex). Call after Stage 1 convergence."""
-        self.use_complex = True
+        mag_before = (amplitudes_before[..., 0] ** 2 + amplitudes_before[..., 1] ** 2).sqrt()
+        mag_after  = (amplitudes_after[..., 0]  ** 2 + amplitudes_after[..., 1]  ** 2).sqrt()
+        delta = mag_after - mag_before
+        constructive = (delta > 0).float().mean()
+        destructive  = (delta < 0).float().mean()
+        return {
+            "constructive": constructive,
+            "destructive":  destructive,
+            "net_change":   delta.mean(),
+        }
