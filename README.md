@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:0d1117,50:01696f,100:0d1117&height=200&section=header&text=Quantum%20Relational%20Reasoner&fontSize=36&fontColor=ffffff&fontAlignY=38&desc=Don't%20collapse%20reality%20until%20evidence%20demands%20it.&descSize=16&descAlignY=60&descColor=4f98a3" alt="QRR Banner"/>
+  <img src="https://user-gen-media-assets.s3.amazonaws.com/gpt4o_images/b8c950b9-cc13-4e87-a4fc-96613c5e4e3b.png" alt="QRR Logo" width="120" height="120"/>
+</p>
+
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:0d1117,50:01696f,100:0d1117&height=160&section=header&text=Quantum%20Relational%20Reasoner&fontSize=34&fontColor=ffffff&fontAlignY=45&desc=Don't%20collapse%20reality%20until%20evidence%20demands%20it.&descSize=15&descAlignY=68&descColor=4f98a3" alt="QRR Banner"/>
 </p>
 
 <p align="center">
@@ -144,6 +148,9 @@ qrr-quantum-relational-reasoner/
 │
 ├── experiments/
 │   └── README.md                  ← Experiment log (EXP-001 pending)
+│
+├── docs/assets/
+│   └── logo_concept.md            ← Logo spec + brand colors
 │
 └── tests/
     └── test_branch_bank.py        ← Unit tests
