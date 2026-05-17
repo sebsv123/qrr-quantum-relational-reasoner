@@ -1,0 +1,36 @@
+# QRR Stage 2 Training Config — GPT-2 base, frozen, COMPLEX amplitudes
+# Use after Stage 1 converges and EXP-002 confirms norm stability.
+# Run: python training/train.py --config training/config_gpt2_stage2.yaml
+
+model:
+  base_model_name: gpt2
+  k_branches: 4
+  chi_threshold: 0.3
+  freeze_base: true
+  use_phase: true   # Stage 2: full complex amplitudes with phase
+
+training:
+  epochs: 15
+  batch_size: 8
+  learning_rate: 3.0e-5   # Lower LR for phase curriculum
+  weight_decay: 0.01
+  grad_clip: 1.0
+  scheduler: cosine
+  warmup_epochs: 2
+  resume_from: checkpoints/stage1/epoch_10.pt  # Load Stage 1 weights
+
+loss:
+  lambda_div: 0.10
+  lambda_dec: 0.05
+  lambda_cal: 0.05
+  lambda_int: 0.05   # Higher interference penalty in Stage 2
+
+data:
+  train_split: 0.8
+  seed: 42
+  max_length: 512
+
+output:
+  checkpoint_dir: checkpoints/stage2
+  save_every_n_epochs: 5
+  log_format: json

@@ -1,0 +1,33 @@
+# QRR Stage 1 Training Config — GPT-2 base, frozen, real amplitudes
+# Run: python training/train.py --config training/config_gpt2_stage1.yaml
+
+model:
+  base_model_name: gpt2
+  k_branches: 4
+  chi_threshold: 0.3
+  freeze_base: true
+  use_phase: false  # Stage 1: real amplitudes only
+
+training:
+  epochs: 10
+  batch_size: 8
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  scheduler: cosine
+
+loss:
+  lambda_div: 0.10   # Branch diversity penalty
+  lambda_dec: 0.05   # Decoherence timing penalty
+  lambda_cal: 0.05   # Calibration penalty
+  lambda_int: 0.02   # Interference coherence penalty
+
+data:
+  train_split: 0.8
+  seed: 42
+  max_length: 512
+
+output:
+  checkpoint_dir: checkpoints/stage1
+  save_every_n_epochs: 5
+  log_format: json

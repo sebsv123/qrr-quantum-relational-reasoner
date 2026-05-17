@@ -1,158 +1,195 @@
 """
-QRR Training Loop.
+QRR Training Loop — Stage 1 (real amplitudes, frozen base).
 
-Trains the QRR modules (branch bank, mixer, router, entanglement)
-on top of a frozen base transformer.
-
-The base LM is frozen by default — we only train the QRR modules.
-This keeps compute requirements low for Phase 1 experiments.
+Trains QRR modules (BranchBank, UnitaryMixer, AmplitudeRouter, DecoherenceModule)
+on top of a frozen pre-trained language model.
 
 Usage:
-    python training/train.py \\
-        --model gpt2 \\
-        --k 4 \\
-        --epochs 3 \\
-        --lr 1e-4 \\
-        --batch_size 16 \\
-        --dataset wikitext
+    python training/train.py --config training/config_gpt2_stage1.yaml
+    python training/train.py --model gpt2 --branches 4 --epochs 5 --lr 1e-4
 """
 
 from __future__ import annotations
 import argparse
+import json
+import time
+from pathlib import Path
 import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
-from datasets import load_dataset
-from tqdm import tqdm
-
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, Dataset
 from qrr.qrr_model import QRRModel
 from training.loss import QRRLoss
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train QRR modules")
-    p.add_argument("--model", default="gpt2")
-    p.add_argument("--k", type=int, default=4, help="Number of branches")
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--max_length", type=int, default=128)
-    p.add_argument("--dataset", default="wikitext", choices=["wikitext", "ptb"])
-    p.add_argument("--chi_threshold", type=float, default=0.3)
-    p.add_argument("--lambda_coh", type=float, default=0.1)
-    p.add_argument("--lambda_dec", type=float, default=0.1)
-    p.add_argument("--lambda_div", type=float, default=0.1)
-    p.add_argument("--warmup_steps", type=int, default=100)
-    p.add_argument("--log_every", type=int, default=50)
-    p.add_argument("--save_dir", default="checkpoints")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args()
+class AmbiguityDataset(Dataset):
+    """
+    Simple dataset of (text, label) pairs where label=1 means ambiguous.
+    Used for Stage 1 curriculum training.
+    """
+    def __init__(self, samples: list[tuple[str, int]]):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
 
 
-def build_dataloader(tokenizer, dataset_name: str, split: str, batch_size: int, max_length: int) -> DataLoader:
-    if dataset_name == "wikitext":
-        raw = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-    else:
-        raw = load_dataset("ptb_text_only", split=split)
-
-    def tokenize(batch):
-        return tokenizer(
-            batch["text"], truncation=True, max_length=max_length,
-            padding="max_length", return_tensors="pt"
-        )
-
-    tokenized = raw.map(tokenize, batched=True, remove_columns=["text"])
-    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
-    return DataLoader(tokenized, batch_size=batch_size, shuffle=True, drop_last=True)
+def collate_fn(batch):
+    texts  = [x[0] for x in batch]
+    labels = torch.tensor([x[1] for x in batch], dtype=torch.float)
+    return texts, labels
 
 
 def train_epoch(
     model: QRRModel,
     loader: DataLoader,
-    optimizer: optim.Optimizer,
+    optimizer,
     scheduler,
     loss_fn: QRRLoss,
     device: str,
-    log_every: int,
+    epoch: int,
 ) -> dict:
     model.train()
-    totals = {"total": 0.0, "token": 0.0, "coh": 0.0, "dec": 0.0, "cal": 0.0, "div": 0.0}
-    steps = 0
+    total_loss = 0.0
+    metrics_sum = {"L_div": 0.0, "L_dec": 0.0, "L_cal": 0.0}
+    n_batches = 0
 
-    for batch in tqdm(loader, desc="Training"):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+    for texts, labels in loader:
+        labels = labels.to(device)
+        optimizer.zero_grad()
 
-        # Targets: next-token prediction (shift right)
-        targets = input_ids[:, 1:].contiguous().view(-1)
-        input_ids_in = input_ids[:, :-1].contiguous()
-        attention_mask_in = attention_mask[:, :-1].contiguous()
-
-        out = model(input_ids_in, attention_mask_in)
-        logits = out["logits"].view(-1, model.output_head.out_features)
+        out = model.forward_with_branches(texts)
         state = out["branch_state"]
 
-        # Heuristic ambiguity label: chi > 0.5 at initialization ≈ ambiguous
-        # In Phase 3, this will be replaced with dataset-provided labels
-        is_ambiguous = (out["chi"] > 0.5).detach()
-
-        losses = loss_fn(
-            logits, targets, state, is_ambiguous,
-            decoherence_module=model.decoherence
+        loss, breakdown = loss_fn(
+            logits=out["logits"],
+            branch_state=state,
+            labels=labels,
         )
-
-        optimizer.zero_grad()
-        losses["total"].backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        scheduler.step()
 
-        for k, v in losses.items():
-            totals[k] += v.item()
-        steps += 1
+        total_loss += loss.item()
+        for k in metrics_sum:
+            metrics_sum[k] += breakdown.get(k, 0.0)
+        n_batches += 1
 
-        if steps % log_every == 0:
-            print(f"  step {steps} | " + " | ".join(f"{k}={v/steps:.4f}" for k, v in totals.items()))
+    scheduler.step()
 
-    return {k: v / steps for k, v in totals.items()}
+    return {
+        "epoch": epoch,
+        "loss":  total_loss / max(n_batches, 1),
+        **{k: v / max(n_batches, 1) for k, v in metrics_sum.items()},
+    }
+
+
+@torch.no_grad()
+def eval_epoch(
+    model: QRRModel,
+    loader: DataLoader,
+    loss_fn: QRRLoss,
+    device: str,
+) -> dict:
+    model.eval()
+    chi_ambiguous, chi_clear = [], []
+
+    for texts, labels in loader:
+        labels = labels.to(device)
+        out = model.forward_with_branches(texts)
+        chi = out["chi_per_sample"].cpu()
+        for i, lbl in enumerate(labels.cpu()):
+            if lbl == 1:
+                chi_ambiguous.append(chi[i].item())
+            else:
+                chi_clear.append(chi[i].item())
+
+    if chi_ambiguous and chi_clear:
+        delta = sum(chi_ambiguous) / len(chi_ambiguous) - sum(chi_clear) / len(chi_clear)
+    else:
+        delta = 0.0
+
+    return {
+        "chi_ambiguous": sum(chi_ambiguous) / max(len(chi_ambiguous), 1),
+        "chi_clear":     sum(chi_clear)     / max(len(chi_clear), 1),
+        "delta_chi":     delta,
+    }
 
 
 def main():
-    args = parse_args()
-    print(f"Training QRR | model={args.model} | K={args.k} | device={args.device}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model",    default="gpt2")
+    parser.add_argument("--branches", type=int, default=4)
+    parser.add_argument("--epochs",   type=int, default=10)
+    parser.add_argument("--lr",       type=float, default=1e-4)
+    parser.add_argument("--batch",    type=int, default=8)
+    parser.add_argument("--output",   default="checkpoints/stage1")
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\nDevice: {device}")
+    print(f"Model: {args.model} | K={args.branches} | lr={args.lr} | epochs={args.epochs}\n")
 
     model = QRRModel(
         base_model_name=args.model,
-        k_branches=args.k,
-        chi_threshold=args.chi_threshold,
+        k_branches=args.branches,
         freeze_base=True,
-    ).to(args.device)
+    ).to(device)
 
-    # Only train QRR modules (base is frozen)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    print(f"Trainable params: {sum(p.numel() for p in trainable):,}")
+    # Minimal demo data — replace with AmbigQA in real training
+    from benchmarks.ambiguity_bench import AMBIGUOUS_INPUTS, CLEAR_INPUTS
+    samples = [(t, 1) for t in AMBIGUOUS_INPUTS] + [(t, 0) for t in CLEAR_INPUTS]
+    dataset = AmbiguityDataset(samples)
+    split = int(0.8 * len(dataset))
+    train_ds, val_ds = torch.utils.data.random_split(dataset, [split, len(dataset) - split])
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,  collate_fn=collate_fn)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False, collate_fn=collate_fn)
 
-    optimizer = optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
-    train_loader = build_dataloader(model.tokenizer, args.dataset, "train", args.batch_size, args.max_length)
-    total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, args.warmup_steps, total_steps)
-    loss_fn = QRRLoss(
-        lambda_coh=args.lambda_coh,
-        lambda_dec=args.lambda_dec,
-        lambda_div=args.lambda_div,
+    optimizer = AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr, weight_decay=1e-2,
     )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    loss_fn = QRRLoss(lambda_div=0.1, lambda_dec=0.05, lambda_cal=0.05)
 
-    import os
-    os.makedirs(args.save_dir, exist_ok=True)
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    history = []
 
     for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
-        metrics = train_epoch(model, train_loader, optimizer, scheduler, loss_fn, args.device, args.log_every)
-        print(f"Epoch {epoch} summary: " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
-        ckpt = f"{args.save_dir}/qrr_{args.model.replace('/', '_')}_K{args.k}_ep{epoch}.pt"
-        torch.save({"model_state": model.state_dict(), "epoch": epoch, "metrics": metrics}, ckpt)
-        print(f"Saved: {ckpt}")
+        t0 = time.time()
+        train_metrics = train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, epoch)
+        val_metrics   = eval_epoch(model, val_loader, loss_fn, device)
+        elapsed = time.time() - t0
+
+        log = {**train_metrics, **val_metrics, "elapsed": elapsed}
+        history.append(log)
+
+        print(
+            f"Epoch {epoch:02d}/{args.epochs} | "
+            f"loss={log['loss']:.4f} | "
+            f"Δχ={log['delta_chi']:.4f} | "
+            f"{elapsed:.1f}s"
+        )
+
+        # Save checkpoint every 5 epochs
+        if epoch % 5 == 0 or epoch == args.epochs:
+            ckpt_path = output_dir / f"epoch_{epoch:02d}.pt"
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "metrics": log,
+            }, ckpt_path)
+            print(f"  Checkpoint saved: {ckpt_path}")
+
+    with open(output_dir / "training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"\nTraining complete. History saved to {output_dir}/training_history.json")
 
 
 if __name__ == "__main__":
